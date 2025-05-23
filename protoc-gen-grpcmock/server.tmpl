@@ -17,7 +17,7 @@ import (
 
 	// Import the grpcmock runtime
 	// Ensure PluginModulePath is correctly set in your generator to your plugin's go module path
-	"{{.PluginModulePath}}/protoc-gen-grpcmock/runtime" 
+	"{{.PluginModulePath}}/protoc-gen-grpcmock/runtime"
 
 	// Dynamic imports for user's proto message types
 	{{range $alias, $path := .Imports}}
@@ -39,28 +39,25 @@ func New{{.GoName}}MockServer() *{{.GoName}}MockServer {
 	return &{{.GoName}}MockServer{}
 }
 
-{{range .Methods}}
-func (s *{{$.GoName}}MockServer) {{.GoName}}(
+{{$service := .}} {{/* Capture the current ServiceData context into $service */}}
+{{range .Methods}} {{/* Current context (.) is MethodData */}}
+func (s *{{$service.GoName}}MockServer) {{.GoName}}(
 	{{if .ClientStreaming}}{{/* For client streaming, the first arg is the stream */}}
 	stream {{$.GoPackageNameToken}}.{{$.GoName}}_{{.GoName}}Server
 	{{else if .ServerStreaming}} {{/* Server streaming has request and stream */}}
 	req *{{.InputType | BaseType}}, stream {{$.GoPackageNameToken}}.{{.GoName}}_{{.GoName}}Server
 	{{else}}
-	ctx context.Context, req *{{.InputType | BaseType}}
+	ctx context.Context, req *{{.InputType | BaseType}},
 	{{end}}
-) {{/* Determine return type based on streaming */}}
-{{if .ServerStreaming}} (error) {{/* Server streaming methods return only an error */}}
-{{else if .ClientStreaming}} (error) {{/* Client streaming SendAndClose also returns an error */}}
-{{else}} (*{{.OutputType | BaseType}}, error) {{/* Unary returns (response, error) */}}
-{{end}} {
-	
+){{if .ServerStreaming}} (error) {{else if .ClientStreaming}} (error) {{else}} (*{{.OutputType | BaseType}}, error) {{end}} {
+
 	fullMethod := "{{.FullMethodName}}"
 	log.Printf("grpcmock: Received call to %s", fullMethod)
 
 	var currentReqProto proto.Message
 	var incomingMD metadata.MD
 	var err error
-	
+
 	{{if .ClientStreaming}}
 	// Client Streaming: match based on the first message.
 	// The runtime can be extended to handle expectations on the entire stream.
@@ -84,7 +81,7 @@ func (s *{{$.GoName}}MockServer) {{.GoName}}(
 	{{end}}
 
 	runtime.RecordCall(fullMethod, incomingMD, currentReqProto)
-	
+
 	expectation := runtime.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
 
 	if expectation == nil {
@@ -110,7 +107,7 @@ func (s *{{$.GoName}}MockServer) {{.GoName}}(
 		}
 		{{end}}
 	}
-	
+
 	// Handle error response
 	if expectation.Response.Error != nil {
 		log.Printf("grpcmock: Returning error for %s: code=%v, msg=%s", fullMethod, expectation.Response.Error.Code, expectation.Response.Error.Message)
@@ -172,14 +169,14 @@ func StartMockServer(grpcPort, httpPort string) {
 	if err != nil {
 		log.Fatalf("grpcmock: failed to listen on gRPC port %s: %v", grpcPort, err)
 	}
-	
+
 	grpcServer := grpc.NewServer()
-	
+
 	{{range .Services}}
 	{{/* Resolve package alias for service registration */}}
 	{{.GoPackageNameToken}}.Register{{.GoName}}Server(grpcServer, New{{.GoName}}MockServer())
 	{{end}}
-	
+
 	log.Printf("grpcmock: gRPC server starting on :%s", grpcPort)
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
@@ -202,7 +199,7 @@ func StartMockServer(grpcPort, httpPort string) {
 func main() {
 	grpcPort := "{{.GRPCPort}}" // Default, can be overridden by flags or env vars
 	httpPort := "{{.HTTPPort}}" // Default, can be overridden by flags or env vars
-	
+
 	if p := os.Getenv("GRPCMOCK_GRPC_PORT"); p != "" {
  		grpcPort = p
 	}
