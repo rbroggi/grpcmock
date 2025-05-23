@@ -1,0 +1,12 @@
+# grpcmock/buf.gen.yaml
+version: v1
+plugins:
+  # Example: Using the grpcmock plugin (assuming it's built and in PATH)
+  # to generate a mock for one of its own example protos.
+  - plugin: grpcmock
+    out: examples/helloworld/out # Output directory for the generated server
+    opt:
+      - http_port=9090
+      - grpc_port=9001
+    # 'path' can be used if protoc-gen-grpcmock is not in $PATH
+    # path: ./protoc-gen-grpcmock # if you run 'go build' in protoc-gen-grpcmock dir

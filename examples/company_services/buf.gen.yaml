@@ -1,0 +1,26 @@
+version: v1
+plugins:
+  # Standard Go and gRPC code generation
+  - plugin: buf.build/protocolbuffers/go:v1.31.0 # Use the latest version
+    out: out/go # Output directory for standard Go files
+    opt:
+      - paths=source_relative
+  - plugin: buf.build/grpc/go:v1.3.0 # Use the latest version
+    out: out/go # Output directory for standard Go gRPC files
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=true
+
+  # Your grpcmock plugin
+  # Assuming 'protoc-gen-grpcmock' is in PATH or specified via plugin path.
+  # If you publish it to BSR, replace 'grpcmock' with 'buf.build/your-org/grpcmock'
+  - plugin: grpcmock # This should be the name of your plugin executable
+    out: out/grpcmock # Output directory for the generated mock server
+    opt:
+      - http_port=9090 # Port for the mock control HTTP server
+      - grpc_port=9001 # Port for the mock gRPC server
+    # The 'out' directory combined with the package structure in the generated server.go
+    # should result in something like 'out/grpcmock/company_services/server.go'.
+    # The exact pathing within 'out/grpcmock' will depend on how your plugin
+    # names the output file and constructs its package declaration.
+    # A single server.go for all processed protos in the 'company_services' group is expected here.

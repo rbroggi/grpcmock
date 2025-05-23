@@ -1,0 +1,8 @@
+version: v1
+name: buf.build/your-org/grpcmock-examples-company-services # Replace with your actual BSR org/repo if you publish
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package company_services.customer.v1;
+
+option go_package = "company_services/customer/v1";
+
+// CustomerService provides APIs for managing Customers.
+service CustomerService {
+  // GetDetails retrieves information about a specific Customer.
+  rpc GetDetails (GetCustomerDetailsRequest) returns (GetCustomerDetailsResponse);
+
+  // ListAll retrieves all Customers.
+  rpc ListAll (ListCustomersRequest) returns (ListCustomersResponse);
+}
+
+message Customer {
+  string id = 1;
+  string name = 2;
+  string location = 3;
+}
+
+message GetCustomerDetailsRequest {
+  string Customer_id = 1;
+}
+
+message GetCustomerDetailsResponse {
+  Customer Customer = 1;
+}
+
+message ListCustomersRequest {
+  // Optional: Add pagination or filtering fields
+  string parent_organization_id = 1;
+}
+
+message ListCustomersResponse {
+  repeated Customer Customers = 1;
+}

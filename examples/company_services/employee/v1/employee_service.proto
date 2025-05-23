@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package company_services.employee.v1;
+
+option go_package = "company_services/employee/v1";
+
+// EmployeeService provides APIs for managing employees.
+service EmployeeService {
+  // GetDetails retrieves information about a specific employee.
+  // This method name collides with DepartmentService.GetDetails.
+  rpc GetDetails (GetEmployeeDetailsRequest) returns (GetEmployeeDetailsResponse);
+
+  // UpdateProfile allows updating an employee's profile.
+  rpc UpdateProfile (UpdateEmployeeProfileRequest) returns (UpdateEmployeeProfileResponse);
+}
+
+message Employee {
+  string id = 1;
+  string name = 2;
+  string position = 3;
+  string department_id = 4;
+}
+
+message GetEmployeeDetailsRequest {
+  string employee_id = 1;
+}
+
+message GetEmployeeDetailsResponse {
+  Employee employee = 1;
+}
+
+message UpdateEmployeeProfileRequest {
+  string employee_id = 1;
+  string name = 2;
+  string position = 3;
+}
+
+message UpdateEmployeeProfileResponse {
+  Employee employee = 1;
+  string status_message = 2;
+}
