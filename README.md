@@ -122,7 +122,7 @@ You can also override ports with environment variables: `GRPCMOCK_GRPC_PORT` and
 1. Setting Expectations (HTTP)
     Send a `POST` request to the `/expectations` endpoint (e.g., `http://localhost:9090/expectations`).
     Example Expectation JSON:
-    ```json
+    ```json5
     {
       "fullMethodName": "/company_services.employee.v1.EmployeeService/GetDetails",
       "requestMatcher": {
