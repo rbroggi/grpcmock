@@ -31,7 +31,7 @@ type {{.GoName}}MockServer struct {
 	// Embed the Unimplemented server for forward compatibility
 	{{$firstMethod := index .Methods 0}}
 	{{/* Resolve the package alias for the UnimplementedServer struct */}}
-	{{$servicePackageAlias := .GoPackageNameToken}}.Unimplemented{{.GoName}}Server
+	{{.GoPackageNameToken}}.Unimplemented{{.GoName}}Server
 }
 
 // New{{.GoName}}MockServer creates a new mock server.
@@ -42,7 +42,9 @@ func New{{.GoName}}MockServer() *{{.GoName}}MockServer {
 {{range .Methods}}
 func (s *{{$.GoName}}MockServer) {{.GoName}}(
 	{{if .ClientStreaming}}{{/* For client streaming, the first arg is the stream */}}
-	stream {{$inputPkg := .InputType | TrimStar | GoPackageNameToken}}{{$inputPkg}}.{{$.GoName}}_{{.GoName}}Server
+	stream {{$.GoPackageNameToken}}.{{$.GoName}}_{{.GoName}}Server
+	{{else if .ServerStreaming}} {{/* Server streaming has request and stream */}}
+	req *{{.InputType | BaseType}}, stream {{$.GoPackageNameToken}}.{{.GoName}}_{{.GoName}}Server
 	{{else}}
 	ctx context.Context, req *{{.InputType | BaseType}}
 	{{end}}
@@ -175,7 +177,7 @@ func StartMockServer(grpcPort, httpPort string) {
 	
 	{{range .Services}}
 	{{/* Resolve package alias for service registration */}}
-	{{$servicePackageAlias := .GoPackageNameToken}}.Register{{.GoName}}Server(grpcServer, New{{.GoName}}MockServer())
+	{{.GoPackageNameToken}}.Register{{.GoName}}Server(grpcServer, New{{.GoName}}MockServer())
 	{{end}}
 	
 	log.Printf("grpcmock: gRPC server starting on :%s", grpcPort)

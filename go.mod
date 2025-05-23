@@ -1,4 +1,4 @@
-module grpcmock
+module github.com/rbroggi/grpcmock
 
 go 1.24
 
