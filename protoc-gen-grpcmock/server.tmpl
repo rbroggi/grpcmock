@@ -2,7 +2,6 @@
 package {{.PackageName}}
 
 import (
-	"io"
 	"context"
 	"flag"
 	"fmt"
@@ -10,6 +9,9 @@ import (
 	"net"
 	"os" 
 	"errors"
+	{{if .HasClientStreamingMethods}}
+	"io"
+	{{end}}
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

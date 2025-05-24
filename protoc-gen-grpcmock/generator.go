@@ -11,11 +11,12 @@ import (
 )
 
 type TemplateData struct {
-	Filename    string
-	PackageName string
-	Services    []ServiceData
-	HTTPPort    string
-	GRPCPort    string
+	Filename                  string
+	PackageName               string
+	Services                  []ServiceData
+	HTTPPort                  string
+	GRPCPort                  string
+	HasClientStreamingMethods bool // New flag
 }
 
 type ServiceData struct {
@@ -52,6 +53,7 @@ func generateMockServer(
 	allServices := []ServiceData{}
 	serviceGoNameCounts := make(map[string]int) // Track occurrences of original Go service names
 	processedFileCount := 0
+	hasAnyClientStreaming := false
 
 	// First pass: Collect all service definitions and determine their unique mock server struct names
 	// We need to collect them first to apply postfixes correctly based on final counts.
@@ -124,6 +126,9 @@ func generateMockServer(
 					GoImportPath: file.GoImportPath,
 				}
 				qualifiedStreamServerType = g.QualifiedGoIdent(streamServerTypeIdent)
+				if method.Desc.IsStreamingClient() {
+					hasAnyClientStreaming = true
+				}
 			}
 
 			inputMsgIdent := method.Input.GoIdent
@@ -153,11 +158,12 @@ func generateMockServer(
 	}
 
 	templateData := TemplateData{
-		Filename:    outputFilename,
-		PackageName: targetPackageName,
-		Services:    allServices,
-		HTTPPort:    httpPort,
-		GRPCPort:    grpcPort,
+		Filename:                  outputFilename,
+		PackageName:               targetPackageName,
+		Services:                  allServices,
+		HTTPPort:                  httpPort,
+		GRPCPort:                  grpcPort,
+		HasClientStreamingMethods: hasAnyClientStreaming, // Pass the flag to the template
 	}
 
 	tmpl, err := template.New("grpcmockServer").Parse(serverTemplateContent)
