@@ -12,91 +12,97 @@ import (
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
+// Config holds all generator options for clarity and maintainability.
+type Config struct {
+	httpPort       string
+	grpcPort       string
+	outputFilename string
+	packageName    string
+}
+
+// parseConfig parses flags and request parameters into a Config struct.
+func parseConfig(req *pluginpb.CodeGeneratorRequest) Config {
+	flags := flag.NewFlagSet("grpcmock", flag.ContinueOnError)
+	cfg := Config{
+		httpPort:       "8081",
+		grpcPort:       "4770",
+		outputFilename: "grpcmockserver.go",
+		packageName:    "main",
+	}
+	flags.StringVar(&cfg.httpPort, "http_port", cfg.httpPort, "Default HTTP port for the mock server")
+	flags.StringVar(&cfg.grpcPort, "grpc_port", cfg.grpcPort, "Default gRPC port for the mock server")
+	flags.StringVar(&cfg.outputFilename, "output_filename", cfg.outputFilename, "Name of the single generated mock server file")
+	flags.StringVar(&cfg.packageName, "package_name", cfg.packageName, "Go package name for the generated server file")
+
+	// Parse parameters from protoc request
+	if req != nil && req.Parameter != nil {
+		params := strings.Split(req.GetParameter(), ",")
+		for _, param := range params {
+			parts := strings.SplitN(param, "=", 2)
+			if len(parts) == 2 {
+				switch parts[0] {
+				case "http_port":
+					cfg.httpPort = parts[1]
+				case "grpc_port":
+					cfg.grpcPort = parts[1]
+				case "output_filename":
+					cfg.outputFilename = parts[1]
+				case "package_name":
+					cfg.packageName = parts[1]
+				}
+			}
+		}
+	}
+	return cfg
+}
+
+// logAndReturn logs an error and returns the given code.
+func logAndReturn(msg string, err error, code int) int {
+	log.Printf(msg, err)
+	return code
+}
+
 func main() {
 	os.Exit(mainLogic())
 }
 
 func mainLogic() int {
-	var flags flag.FlagSet
-	httpPort := flags.String("http_port", "8081", "Default HTTP port for the mock server")
-	grpcPort := flags.String("grpc_port", "4770", "Default gRPC port for the mock server")
-	// This output_filename will be the name of the single generated server file.
-	outputFilename := flags.String("output_filename", "grpcmockserver.go", "Name of the single generated mock server file")
-	// This packageName will be the package of the single generated server file (e.g., "main").
-	packageName := flags.String("package_name", "main", "Go package name for the generated server file")
-	// Module path for importing the runtime, ensure this matches your project's module path.
-	// It's now taken from a const in generator.go but could be an option if more flexibility is needed.
-	// pluginModulePath := flags.String("module_path", "github.com/rbroggi/grpcmock", "Go module path of the grpcmock project for runtime import")
-
 	input, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		log.Printf("grpcmock: failed to read input: %v", err)
-		return 1
+		return logAndReturn("grpcmock: failed to read input: %v", err, 1)
 	}
 
 	req := &pluginpb.CodeGeneratorRequest{}
 	if err := proto.Unmarshal(input, req); err != nil {
-		log.Printf("grpcmock: failed to unmarshal CodeGeneratorRequest: %v", err)
-		return 1
+		return logAndReturn("grpcmock: failed to unmarshal CodeGeneratorRequest: %v", err, 1)
 	}
 
-	optsMap := make(map[string]string)
-	if req.Parameter != nil {
-		params := strings.Split(req.GetParameter(), ",")
-		for _, param := range params {
-			parts := strings.SplitN(param, "=", 2)
-			if len(parts) == 2 {
-				optsMap[parts[0]] = parts[1]
-			}
-		}
-	}
-
-	if port, ok := optsMap["http_port"]; ok {
-		*httpPort = port
-	}
-	if port, ok := optsMap["grpc_port"]; ok {
-		*grpcPort = port
-	}
-	if name, ok := optsMap["output_filename"]; ok {
-		*outputFilename = name
-	}
-	if pkg, ok := optsMap["package_name"]; ok {
-		*packageName = pkg
-	}
-	// if modPath, ok := optsMap["module_path"]; ok {
-	// 	*pluginModulePath = modPath
-	// }
+	cfg := parseConfig(req)
 
 	opts := protogen.Options{
-		ParamFunc: flags.Set,
+		ParamFunc: nil, // Do not use flag.CommandLine.Set; we handle params ourselves
 	}
 
 	plugin, err := opts.New(req)
 	if err != nil {
-		log.Printf("grpcmock: failed to create plugin: %v", err)
-		return 1
+		return logAndReturn("grpcmock: failed to create plugin: %v", err, 1)
 	}
 
 	plugin.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 
-	// Call generateMockServer ONCE with the plugin object, which contains all files.
-	if err := generateMockServer(plugin, *outputFilename, *packageName, *httpPort, *grpcPort); err != nil {
-		// plugin.Error sets the error in the response to protoc
+	if err := generateMockServer(plugin, cfg.outputFilename, cfg.packageName, cfg.httpPort, cfg.grpcPort); err != nil {
 		plugin.Error(err)
-		// also log it for plugin's own stderr trace
 		log.Printf("grpcmock: error generating mock server: %v", err)
 	}
 
 	resp := plugin.Response()
 	out, err := proto.Marshal(resp)
 	if err != nil {
-		log.Printf("grpcmock: failed to marshal response: %v", err)
-		return 1
+		return logAndReturn("grpcmock: failed to marshal response: %v", err, 1)
 	}
 
 	if _, err := os.Stdout.Write(out); err != nil {
-		log.Printf("grpcmock: failed to write response: %v", err)
-		return 1
+		return logAndReturn("grpcmock: failed to write response: %v", err, 1)
 	}
 	return 0
 }

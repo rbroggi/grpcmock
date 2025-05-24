@@ -10,36 +10,85 @@ import (
 	"google.golang.org/protobuf/compiler/protogen"
 )
 
+// TemplateData holds all data passed to the server template for code generation.
 type TemplateData struct {
-	Filename                  string
-	PackageName               string
-	Services                  []ServiceData
-	HTTPPort                  string
-	GRPCPort                  string
-	HasClientStreamingMethods bool // New flag
+	Filename                  string        // Name of the generated file
+	PackageName               string        // Go package name for the generated file
+	Services                  []ServiceData // All services to mock
+	HTTPPort                  string        // HTTP port for the mock server
+	GRPCPort                  string        // gRPC port for the mock server
+	HasClientStreamingMethods bool          // True if any service has client streaming methods
 }
 
+// ServiceData holds information about a single gRPC service for code generation.
 type ServiceData struct {
-	OriginalGoName                   string // Original Go service name, e.g., "CustomerService"
-	MockServerStructName             string // Potentially postfixed name for the mock struct, e.g., "CustomerServiceMockServer" or "CustomerService_2MockServer"
-	QualifiedUnimplementedServerType string // Fully qualified original UnimplementedServer type
-	QualifiedRegisterServerFuncName  string // Fully qualified original RegisterServer function
-	Methods                          []MethodData
+	OriginalGoName                   string       // Original Go service name, e.g., "CustomerService"
+	MockServerStructName             string       // Unique mock struct name, e.g., "CustomerServiceMockServer" or "CustomerServiceMockServer2"
+	QualifiedUnimplementedServerType string       // Fully qualified UnimplementedServer type
+	QualifiedRegisterServerFuncName  string       // Fully qualified RegisterServer function
+	Methods                          []MethodData // Methods of the service
 }
 
+// MethodData holds information about a single gRPC method for code generation.
 type MethodData struct {
-	Name                      string
-	GoName                    string
-	InputType                 string
-	OutputType                string
-	ClientStreaming           bool
-	ServerStreaming           bool
-	FullMethodName            string
-	QualifiedStreamServerType string // Fully qualified original stream server type for this method
+	Name                      string // Original method name
+	GoName                    string // Go method name
+	InputType                 string // Fully qualified input type
+	OutputType                string // Fully qualified output type
+	ClientStreaming           bool   // True if client streaming
+	ServerStreaming           bool   // True if server streaming
+	FullMethodName            string // Full gRPC method name
+	QualifiedStreamServerType string // Fully qualified stream server type (if streaming)
 }
 
 //go:embed server.tmpl
 var serverTemplateContent string
+
+// pendingService is a helper struct for the first pass of service collection.
+type pendingService struct {
+	file    *protogen.File
+	service *protogen.Service
+}
+
+// countServiceNames counts occurrences of each service Go name across all files.
+func countServiceNames(files []*protogen.File) map[string]int {
+	counts := make(map[string]int)
+	for _, file := range files {
+		if !file.Generate || len(file.Services) == 0 {
+			continue
+		}
+		for _, service := range file.Services {
+			counts[service.GoName]++
+		}
+	}
+	return counts
+}
+
+// collectPendingServices collects all services to be processed.
+func collectPendingServices(files []*protogen.File) []pendingService {
+	var pending []pendingService
+	for _, file := range files {
+		if !file.Generate || len(file.Services) == 0 {
+			continue
+		}
+		for _, service := range file.Services {
+			pending = append(pending, pendingService{file: file, service: service})
+		}
+	}
+	return pending
+}
+
+// hasClientStreaming checks if any method in the services is client streaming.
+func hasClientStreaming(services []ServiceData) bool {
+	for _, svc := range services {
+		for _, m := range svc.Methods {
+			if m.ClientStreaming {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func generateMockServer(
 	gen *protogen.Plugin,
@@ -50,62 +99,36 @@ func generateMockServer(
 	}
 	g := gen.NewGeneratedFile(outputFilename, protogen.GoImportPath(targetPackageName))
 
-	allServices := []ServiceData{}
-	serviceGoNameCounts := make(map[string]int) // Track occurrences of original Go service names
-	processedFileCount := 0
-	hasAnyClientStreaming := false
-
-	// First pass: Collect all service definitions and determine their unique mock server struct names
-	// We need to collect them first to apply postfixes correctly based on final counts.
-	type pendingService struct {
-		file    *protogen.File
-		service *protogen.Service
-	}
-	var pendingServices []pendingService
-
-	for _, file := range gen.Files {
-		if !file.Generate || len(file.Services) == 0 {
-			continue
-		}
-		processedFileCount++
-		for _, service := range file.Services {
-			pendingServices = append(pendingServices, pendingService{file: file, service: service})
-			serviceGoNameCounts[service.GoName]++
-		}
-	}
-
-	if processedFileCount == 0 {
+	serviceGoNameCounts := countServiceNames(gen.Files)
+	pendingServices := collectPendingServices(gen.Files)
+	if len(pendingServices) == 0 {
 		log.Println("grpcmock: No services found in .proto files to generate a mock server.")
 		return nil
 	}
 
-	// Second pass: Generate ServiceData with unique names
 	// Tracks how many times a base name has been used for MockServerStructName
 	serviceFinalNameTracker := make(map[string]int)
+	allServices := []ServiceData{}
 
 	for _, ps := range pendingServices {
 		file := ps.file
 		service := ps.service
-
 		originalGoName := service.GoName
 
-		currentCount := serviceFinalNameTracker[originalGoName]
-		currentCount++
+		currentCount := serviceFinalNameTracker[originalGoName] + 1
 		serviceFinalNameTracker[originalGoName] = currentCount
 
-		mockServerStructNameBase := originalGoName                      // Base for the struct (e.g., CustomerService)
-		mockServerStructName := mockServerStructNameBase + "MockServer" // e.g. CustomerServiceMockServer
-		if serviceGoNameCounts[originalGoName] > 1 {                    // If this name appears more than once across all files
-			// e.g. CustomerServiceMockServer2
+		mockServerStructName := originalGoName + "MockServer"
+		if serviceGoNameCounts[originalGoName] > 1 {
 			mockServerStructName = fmt.Sprintf("%s%d", mockServerStructName, currentCount)
 		}
 
 		unimplementedServerTypeIdent := protogen.GoIdent{
-			GoName:       "Unimplemented" + originalGoName + "Server", // Based on original service name
+			GoName:       "Unimplemented" + originalGoName + "Server",
 			GoImportPath: file.GoImportPath,
 		}
 		registerServerFuncIdent := protogen.GoIdent{
-			GoName:       "Register" + originalGoName + "Server", // Based on original service name
+			GoName:       "Register" + originalGoName + "Server",
 			GoImportPath: file.GoImportPath,
 		}
 
@@ -122,13 +145,10 @@ func generateMockServer(
 			var qualifiedStreamServerType string
 			if method.Desc.IsStreamingClient() || method.Desc.IsStreamingServer() {
 				streamServerTypeIdent := protogen.GoIdent{
-					GoName:       originalGoName + "_" + method.GoName + "Server", // Stream type uses original service name
+					GoName:       originalGoName + "_" + method.GoName + "Server",
 					GoImportPath: file.GoImportPath,
 				}
 				qualifiedStreamServerType = g.QualifiedGoIdent(streamServerTypeIdent)
-				if method.Desc.IsStreamingClient() {
-					hasAnyClientStreaming = true
-				}
 			}
 
 			inputMsgIdent := method.Input.GoIdent
@@ -163,7 +183,7 @@ func generateMockServer(
 		Services:                  allServices,
 		HTTPPort:                  httpPort,
 		GRPCPort:                  grpcPort,
-		HasClientStreamingMethods: hasAnyClientStreaming, // Pass the flag to the template
+		HasClientStreamingMethods: hasClientStreaming(allServices),
 	}
 
 	tmpl, err := template.New("grpcmockServer").Parse(serverTemplateContent)
