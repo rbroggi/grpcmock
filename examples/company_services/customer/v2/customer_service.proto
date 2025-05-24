@@ -8,6 +8,15 @@ option go_package = "github.com/rbroggi/grpcmock/examples/company_services/proto
 service CustomerService {
   // GetDetails retrieves information about a specific Customer.
   rpc GetDetails (GetCustomerDetailsRequest) returns (GetCustomerDetailsResponse);
+
+  // Server streaming: Lists all customers.
+  rpc ListCustomers (ListCustomersRequest) returns (stream Customer);
+
+  // Client streaming: Uploads multiple customers.
+  rpc UploadCustomers (stream UploadCustomerRequest) returns (UploadCustomersResponse);
+
+  // Bidirectional streaming: Chat with support.
+  rpc ChatWithSupport (stream SupportMessage) returns (stream SupportMessage);
 }
 
 message Customer {
@@ -21,4 +30,24 @@ message GetCustomerDetailsRequest {
 
 message GetCustomerDetailsResponse {
   Customer Customer = 1;
+}
+
+// Server streaming request
+message ListCustomersRequest {}
+
+// Client streaming request
+message UploadCustomerRequest {
+  Customer customer = 1;
+}
+
+// Client streaming response
+message UploadCustomersResponse {
+  int32 count = 1;
+}
+
+// Bidirectional streaming message
+message SupportMessage {
+  string sender = 1;
+  string message = 2;
+  int64 timestamp = 3;
 }

@@ -2,6 +2,7 @@
 package {{.PackageName}}
 
 import (
+	"io"
 	"context"
 	"flag"
 	"fmt"
@@ -42,7 +43,6 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 	ctx context.Context, req *{{.InputType}},
 	{{end}}
 ) {{if .ServerStreaming}} (error) {{else if .ClientStreaming}} (error) {{else}} (*{{.OutputType}}, error) {{end}} {
-	
 	fullMethod := "{{.FullMethodName}}"
 	log.Printf("grpcmock: Received call to %s (mock server type: %s)", fullMethod, "{{$service.MockServerStructName}}")
 
