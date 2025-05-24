@@ -3,7 +3,7 @@ package {{.PackageName}}
 
 import (
 	"context"
-	"flag" 
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -12,27 +12,28 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status" 
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto" 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/grpc/status"
 
 	"github.com/rbroggi/grpcmock/protoc-gen-grpcmock/runtime"
 )
 
 {{range .Services}}
-// {{.GoName}}MockServer is the mock server for the {{.GoName}} service.
-type {{.GoName}}MockServer struct {
-	{{.QualifiedUnimplementedServerType}} // Use the fully qualified type
+// {{.MockServerStructName}} is the mock server for the {{.OriginalGoName}} service.
+type {{.MockServerStructName}} struct {
+	{{.QualifiedUnimplementedServerType}} 
 }
 
-// New{{.GoName}}MockServer creates a new mock server.
-func New{{.GoName}}MockServer() *{{.GoName}}MockServer {
-	return &{{.GoName}}MockServer{}
+// New{{.MockServerStructName}} creates a new mock server.
+func New{{.MockServerStructName}}() *{{.MockServerStructName}} {
+	return &{{.MockServerStructName}}{}
 }
 
 {{$service := .}} 
 {{range .Methods}} 
-func (s *{{$service.GoName}}MockServer) {{.GoName}}(
+// Method {{.GoName}} on mock server {{$service.MockServerStructName}} for gRPC service {{$service.OriginalGoName}}
+func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 	{{if .ClientStreaming}}
 	stream {{.QualifiedStreamServerType}},
 	{{else if .ServerStreaming}}
@@ -40,10 +41,10 @@ func (s *{{$service.GoName}}MockServer) {{.GoName}}(
 	{{else}} // Unary
 	ctx context.Context, req *{{.InputType}},
 	{{end}}
-) {{if .ServerStreaming}} (error) {{else if .ClientStreaming}} (error) {{else}} (*{{.OutputType}}, error) {{end}} { // .OutputType is already fully qualified
+) {{if .ServerStreaming}} (error) {{else if .ClientStreaming}} (error) {{else}} (*{{.OutputType}}, error) {{end}} {
 	
 	fullMethod := "{{.FullMethodName}}"
-	log.Printf("grpcmock: Received call to %s", fullMethod)
+	log.Printf("grpcmock: Received call to %s (mock server type: %s)", fullMethod, "{{$service.MockServerStructName}}")
 
 	var currentReqProto proto.Message
 	var incomingMD metadata.MD
@@ -58,7 +59,7 @@ func (s *{{$service.GoName}}MockServer) {{.GoName}}(
 		log.Printf("grpcmock: Error receiving from client stream for %s: %v", fullMethod, errRecv)
 		return status.Errorf(codes.Internal, "error receiving from client stream: %v", errRecv)
 	} else {
-		currentReqProto = firstReqProto // Assign the received proto.Message
+		currentReqProto = firstReqProto
 	}
 	incomingMD, _ = metadata.FromIncomingContext(stream.Context())
 	{{else if .ServerStreaming}}
@@ -101,7 +102,7 @@ func (s *{{$service.GoName}}MockServer) {{.GoName}}(
 	}
 
 	{{if .ServerStreaming}}
-		resp := new({{.OutputType}}) // Create new instance of the qualified OutputType
+		resp := new({{.OutputType}}) 
 		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil { 
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return status.Errorf(codes.Internal, "failed to unmarshal mock server stream response: %v", errUnmarshal)
@@ -113,28 +114,24 @@ func (s *{{$service.GoName}}MockServer) {{.GoName}}(
 		return nil 
 	{{else if .ClientStreaming}}
 		for {
-			// If firstReqProto was nil (EOF on first Recv), this loop won't execute meaningfully for subsequent Recv.
-			// The primary Recv for matching is done above. This loop is to consume the rest.
-			// If currentReqProto is already nil due to initial EOF, this loop might not be what's intended.
-			// For simplicity, let's assume stream was open and first message was for matching.
-			if currentReqProto == nil && firstReqProto == nil { // Stream was empty from start
+			if currentReqProto == nil && firstReqProto == nil { 
                 break
             }
-			_, errLoop := stream.Recv() // Consume subsequent messages
+			_, errLoop := stream.Recv() 
 			if errLoop == io.EOF { break }
 			if errLoop != nil {
 				log.Printf("grpcmock: Error receiving subsequent message from client stream for %s: %v", fullMethod, errLoop)
 				return status.Errorf(codes.Internal, "error in client stream: %v", errLoop)
 			}
 		}
-		resp := new({{.OutputType}}) // Create new instance
+		resp := new({{.OutputType}})
 		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return status.Errorf(codes.Internal, "failed to unmarshal mock client stream response: %v", errUnmarshal)
 		}
 		return stream.SendAndClose(resp)
 	{{else}} // Unary
-		resp := new({{.OutputType}}) // Create new instance of the qualified OutputType
+		resp := new({{.OutputType}}) 
 		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return nil, status.Errorf(codes.Internal, "failed to unmarshal mock unary response: %v", errUnmarshal)
@@ -154,13 +151,12 @@ func StartMockServer(grpcPort, httpPort string) {
 	grpcServer := grpc.NewServer()
 	
 	{{range .Services}}
-	// Use the pre-qualified function name for registration
-	{{.QualifiedRegisterServerFuncName}}(grpcServer, New{{.GoName}}MockServer())
+	// Use QualifiedRegisterServerFuncName (based on OriginalGoName) and NewMockServerStructName
+	{{.QualifiedRegisterServerFuncName}}(grpcServer, New{{.MockServerStructName}}())
 	{{end}}
 	
 	log.Printf("grpcmock: gRPC server starting on :%s", grpcPort)
 	go func() {
-		// Use errors.Is to prevent logging an error on graceful shutdown
 		if serveErr := grpcServer.Serve(lis); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
 			log.Fatalf("grpcmock: failed to serve gRPC: %v", serveErr)
 		}

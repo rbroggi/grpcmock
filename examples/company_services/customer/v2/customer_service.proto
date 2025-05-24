@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package company_services.customer.v2;
+
+option go_package = "github.com/rbroggi/grpcmock/examples/company_services/protos/customer/v2";
+
+// CustomerService provides APIs for managing Customers.
+service CustomerService {
+  // GetDetails retrieves information about a specific Customer.
+  rpc GetDetails (GetCustomerDetailsRequest) returns (GetCustomerDetailsResponse);
+}
+
+message Customer {
+  string id = 1;
+  string name = 2;
+}
+
+message GetCustomerDetailsRequest {
+  string Customer_id = 1;
+}
+
+message GetCustomerDetailsResponse {
+  Customer Customer = 1;
+}
