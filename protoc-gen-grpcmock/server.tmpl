@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os" 
+	"os"
 	"errors"
+	"syscall"
+	"os/signal"
 	{{if .HasClientStreamingMethods}}
 	"io"
 	{{end}}
@@ -19,13 +21,21 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/grpc/status"
 
-	"github.com/rbroggi/grpcmock/protoc-gen-grpcmock/runtime"
+	"github.com/rbroggi/grpcmock/internal/runtime/storage"
+	"github.com/rbroggi/grpcmock/internal/runtime/server"
+	"github.com/rbroggi/grpcmock/internal/runtime/matcher"
+)
+
+// --- Global runtime wiring ---
+var (
+	expectationsStore   = storage.New()
+	expectationsMatcher = matcher.New(expectationsStore)
 )
 
 {{range .Services}}
 // {{.MockServerStructName}} is the mock server for the {{.OriginalGoName}} service.
 type {{.MockServerStructName}} struct {
-	{{.QualifiedUnimplementedServerType}} 
+	{{.QualifiedUnimplementedServerType}}
 }
 
 // New{{.MockServerStructName}} creates a new mock server.
@@ -33,8 +43,8 @@ func New{{.MockServerStructName}}() *{{.MockServerStructName}} {
 	return &{{.MockServerStructName}}{}
 }
 
-{{$service := .}} 
-{{range .Methods}} 
+{{$service := .}}
+{{range .Methods}}
 // Method {{.GoName}} on mock server {{$service.MockServerStructName}} for gRPC service {{$service.OriginalGoName}}
 func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 	{{if .ClientStreaming}}
@@ -50,13 +60,13 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 
 	var currentReqProto proto.Message
 	var incomingMD metadata.MD
-	var err error 
-	
+	var err error
+
 	{{if .ClientStreaming}}
 	firstReqProto, errRecv := stream.Recv()
 	if errRecv == io.EOF {
 		log.Printf("grpcmock: Client stream for %s ended before any message for matching.", fullMethod)
-		currentReqProto = nil 
+		currentReqProto = nil
 	} else if errRecv != nil {
 		log.Printf("grpcmock: Error receiving from client stream for %s: %v", fullMethod, errRecv)
 		return status.Errorf(codes.Internal, "error receiving from client stream: %v", errRecv)
@@ -65,16 +75,16 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 	}
 	incomingMD, _ = metadata.FromIncomingContext(stream.Context())
 	{{else if .ServerStreaming}}
-	currentReqProto = req 
+	currentReqProto = req
 	incomingMD, _ = metadata.FromIncomingContext(stream.Context())
 	{{else}} // Unary
 	currentReqProto = req
 	incomingMD, _ = metadata.FromIncomingContext(ctx)
 	{{end}}
 
-	runtime.RecordCall(fullMethod, incomingMD, currentReqProto)
-	
-	expectation := runtime.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
+	expectationsStore.RecordCall(fullMethod, incomingMD, currentReqProto)
+
+	expectation := expectationsMatcher.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
 
 	if expectation == nil {
 		err = status.Errorf(codes.Unimplemented, "no matching expectation for %s", fullMethod)
@@ -96,7 +106,7 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 			{{if or .ClientStreaming .ServerStreaming}} if headerErr != nil { return headerErr } {{end}}
 		}
 	}
-	
+
 	if expectation.Response.Error != nil {
 		log.Printf("grpcmock: Returning error for %s: code=%v, msg=%s", fullMethod, expectation.Response.Error.Code, expectation.Response.Error.Message)
 		err = status.Errorf(expectation.Response.Error.Code, expectation.Response.Error.Message)
@@ -104,8 +114,8 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 	}
 
 	{{if .ServerStreaming}}
-		resp := new({{.OutputType}}) 
-		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil { 
+		resp := new({{.OutputType}})
+		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return status.Errorf(codes.Internal, "failed to unmarshal mock server stream response: %v", errUnmarshal)
 		}
@@ -113,13 +123,13 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 			log.Printf("grpcmock: Error sending server stream response for %s: %v", fullMethod, errSend)
 			return errSend
 		}
-		return nil 
+		return nil
 	{{else if .ClientStreaming}}
 		for {
-			if currentReqProto == nil && firstReqProto == nil { 
+			if currentReqProto == nil && firstReqProto == nil {
                 break
             }
-			_, errLoop := stream.Recv() 
+			_, errLoop := stream.Recv()
 			if errLoop == io.EOF { break }
 			if errLoop != nil {
 				log.Printf("grpcmock: Error receiving subsequent message from client stream for %s: %v", fullMethod, errLoop)
@@ -127,14 +137,14 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 			}
 		}
 		resp := new({{.OutputType}})
-		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
+		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return status.Errorf(codes.Internal, "failed to unmarshal mock client stream response: %v", errUnmarshal)
 		}
 		return stream.SendAndClose(resp)
 	{{else}} // Unary
-		resp := new({{.OutputType}}) 
-		if errUnmarshal := runtime.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
+		resp := new({{.OutputType}})
+		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
 			return nil, status.Errorf(codes.Internal, "failed to unmarshal mock unary response: %v", errUnmarshal)
 		}
@@ -149,14 +159,14 @@ func StartMockServer(grpcPort, httpPort string) {
 	if err != nil {
 		log.Fatalf("grpcmock: failed to listen on gRPC port %s: %v", grpcPort, err)
 	}
-	
+
 	grpcServer := grpc.NewServer()
-	
+
 	{{range .Services}}
 	// Use QualifiedRegisterServerFuncName (based on OriginalGoName) and NewMockServerStructName
 	{{.QualifiedRegisterServerFuncName}}(grpcServer, New{{.MockServerStructName}}())
 	{{end}}
-	
+
 	log.Printf("grpcmock: gRPC server starting on :%s", grpcPort)
 	go func() {
 		if serveErr := grpcServer.Serve(lis); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
@@ -164,19 +174,30 @@ func StartMockServer(grpcPort, httpPort string) {
 		}
 	}()
 
-	_, httpShutdown := runtime.StartHTTPServer(httpPort, nil)
+	_, httpShutdown := server.StartHTTPServer(httpPort, nil, expectationsStore)
 
 	log.Println("grpcmock: Servers started. Press Ctrl+C to exit.")
-	runtime.ListenForShutdownSignal(func() {
+	listenForShutdownSignal(func() {
 		log.Println("grpcmock: shutting down gRPC server...")
 		grpcServer.GracefulStop()
 		log.Println("grpcmock: gRPC server stopped.")
-	}, httpShutdown) 
+	}, httpShutdown)
 	log.Println("grpcmock: All servers shut down.")
 }
 
+// listenForShutdownSignal is a helper to wait for OS signals for graceful shutdown
+func listenForShutdownSignal(shutdownFuncs ...func()) {
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+    log.Println("grpcmockruntime: Shutdown signal received...")
+    for _, sf := range shutdownFuncs {
+        sf()
+    }
+}
+
 func main() {
-	var grpcPort, httpPort string 
+	var grpcPort, httpPort string
 
 	defaultGrpcPort := "{{.GRPCPort}}"
 	defaultHttpPort := "{{.HTTPPort}}"

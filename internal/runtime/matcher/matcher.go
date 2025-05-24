@@ -1,4 +1,4 @@
-package runtime
+package matcher
 
 import (
 	"encoding/json"
@@ -7,9 +7,20 @@ import (
 	"reflect"
 	"regexp"
 
+	"github.com/rbroggi/grpcmock/internal/runtime"
+	"github.com/rbroggi/grpcmock/internal/runtime/storage"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
+
+// storeInterface defines the methods for expectation and call storage.
+type storeInterface interface {
+	AddExpectation(exp runtime.GRPCCallExpectation) error
+	GetExpectations() map[string][]runtime.GRPCCallExpectation
+	ClearAll()
+	RecordCall(fullMethodName string, headers map[string][]string, reqBodyProto proto.Message)
+	GetRecordedCalls() []runtime.RecordedGRPCCall
+}
 
 func matchesRegex(pattern, text string) bool {
 	if pattern == "" { // an empty pattern could mean "any value" if not specified, or exact empty string.
@@ -123,25 +134,32 @@ func deepCompare(expected, actual interface{}, exact bool) bool {
 	}
 }
 
+// Matcher provides expectation matching using a storeInterface.
+type Matcher struct {
+	Store storeInterface
+}
+
+// New creates a new Matcher with the given store.
+func New(store storeInterface) *Matcher {
+	return &Matcher{Store: store}
+}
+
 // FindMatchingExpectation finds an expectation that matches the given gRPC call details.
-// It now correctly uses proto.Message with protojson.Marshal.
-func FindMatchingExpectation(fullMethodName string, headers metadata.MD, reqBodyProto proto.Message) *GRPCCallExpectation {
-	mu.RLock()
-	defer mu.RUnlock()
+func (m *Matcher) FindMatchingExpectation(fullMethodName string, headers metadata.MD, reqBodyProto proto.Message) *runtime.GRPCCallExpectation {
+	expectations := m.Store.GetExpectations()
 
 	reqBodyJSONBytes := []byte("{}") // Default to empty JSON if reqBodyProto is nil or marshalling fails
 	if reqBodyProto != nil {
 		var err error
-		reqBodyJSONBytes, err = DefaultMarshaler.Marshal(reqBodyProto) // Directly use reqBodyProto
+		reqBodyJSONBytes, err = storage.DefaultMarshaler.Marshal(reqBodyProto) // Directly use reqBodyProto
 		if err != nil {
 			log.Printf("grpcmockruntime: error marshalling request body to JSON for matching call '%s': %v", fullMethodName, err)
-			// Depending on desired behavior, you might want to return or try matching with empty body
-			// For now, we proceed with an empty JSON representation of the body on error.
-			reqBodyJSONBytes = []byte(`{"error_marshalling_request_body": "true"}`) // Or some other indicator
+			// Proceed with an empty JSON representation of the body on error.
+			reqBodyJSONBytes = []byte(`{"error_marshalling_request_body": "true"}`)
 		}
 	}
 
-	for _, exp := range expectationsStore[fullMethodName] {
+	for _, exp := range expectations[fullMethodName] {
 		if exp.RequestMatcher == nil { // Match-any if no specific matcher
 			log.Printf("grpcmockruntime: Matched (any) expectation for %s", fullMethodName)
 			return &exp
@@ -177,21 +195,17 @@ func FindMatchingExpectation(fullMethodName string, headers metadata.MD, reqBody
 		// Match Body
 		bodyMatch := true
 		if exp.RequestMatcher.Body != nil {
-			// If expectation has a body matcher, but the live request had no body (or failed marshalling to a non-empty representation)
 			if string(reqBodyJSONBytes) == "{}" && len(exp.RequestMatcher.Body) > 0 {
 				bodyMatch = false
 			} else if string(reqBodyJSONBytes) == `{"error_marshalling_request_body": "true"}` && len(exp.RequestMatcher.Body) > 0 {
-				// If marshalling failed, we can't meaningfully compare the body.
 				bodyMatch = false
 			} else {
 				var actualBodyMap map[string]interface{}
-				// Unmarshal the JSON bytes from the live request (marshalled by protojson)
 				if err := json.Unmarshal(reqBodyJSONBytes, &actualBodyMap); err != nil {
 					log.Printf("grpcmockruntime: error unmarshalling actual request body JSON for matching call '%s': %v. JSON: %s", fullMethodName, err, string(reqBodyJSONBytes))
 					bodyMatch = false
 				} else {
-					// exp.RequestMatcher.Body is already map[string]interface{} from user's JSON expectation
-					if !deepCompare(exp.RequestMatcher.Body, actualBodyMap, true) { // exact match for now
+					if !deepCompare(exp.RequestMatcher.Body, actualBodyMap, true) {
 						bodyMatch = false
 						log.Printf("grpcmockruntime: Body mismatch for expectation on %s. Expected: %v, Actual (from proto): %v (JSON: %s)", fullMethodName, exp.RequestMatcher.Body, actualBodyMap, string(reqBodyJSONBytes))
 					}
@@ -203,13 +217,12 @@ func FindMatchingExpectation(fullMethodName string, headers metadata.MD, reqBody
 			continue // Try next expectation
 		}
 
-		// If both headers and body (if specified) match
 		if headersMatch && bodyMatch {
 			log.Printf("grpcmockruntime: Matched expectation for %s (Headers: %v, Body: %v)",
 				fullMethodName, headersMatch, bodyMatch)
 			return &exp
 		}
 	}
-	log.Printf("grpcmockruntime: No matching expectation found for %s. Checked %d expectations.", fullMethodName, len(expectationsStore[fullMethodName]))
+	log.Printf("grpcmockruntime: No matching expectation found for %s. Checked %d expectations.", fullMethodName, len(expectations[fullMethodName]))
 	return nil
 }

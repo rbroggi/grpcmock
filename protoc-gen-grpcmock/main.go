@@ -12,6 +12,10 @@ import (
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
+func main() {
+	os.Exit(mainLogic())
+}
+
 // Config holds all generator options for clarity and maintainability.
 type Config struct {
 	httpPort       string
@@ -60,10 +64,6 @@ func parseConfig(req *pluginpb.CodeGeneratorRequest) Config {
 func logAndReturn(msg string, err error, code int) int {
 	log.Printf(msg, err)
 	return code
-}
-
-func main() {
-	os.Exit(mainLogic())
 }
 
 func mainLogic() int {
