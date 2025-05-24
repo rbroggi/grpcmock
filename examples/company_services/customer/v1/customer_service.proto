@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package company_services.customer.v1;
 
-option go_package = "company_services/customer/v1";
+option go_package = "github.com/rbroggi/grpcmock/examples/company_services/protos/customer/v1";
 
 // CustomerService provides APIs for managing Customers.
 service CustomerService {

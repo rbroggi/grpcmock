@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package company_services.employee.v1;
 
-option go_package = "company_services/employee/v1";
+option go_package = "github.com/rbroggi/grpcmock/examples/company_services/protos/employee/v1";
 
 // EmployeeService provides APIs for managing employees.
 service EmployeeService {

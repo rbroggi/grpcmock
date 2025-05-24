@@ -2,11 +2,11 @@ version: v1
 plugins:
   # Standard Go and gRPC code generation
   - plugin: buf.build/protocolbuffers/go:v1.31.0
-    out: out/go
+    out: protos
     opt:
       - paths=source_relative
   - plugin: buf.build/grpc/go:v1.3.0
-    out: out/go
+    out: protos
     opt:
       - paths=source_relative
       - require_unimplemented_servers=true
@@ -14,7 +14,7 @@ plugins:
   # Your grpcmock plugin
   - plugin: grpcmock
     strategy: all
-    out: out/grpcmock # This will now contain a single server file (e.g., grpcmockserver.go)
+    out: protos # This will now contain a single server file (e.g., grpcmockserver.go)
     opt:
       - http_port=9090
       - grpc_port=9001
