@@ -45,6 +45,43 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 		handleVerifications(w, r, store)
 	})
 
+	// Add endpoints for match counts and satisfaction verification
+	typedStore, ok := store.(interface {
+		GetMatchCounts() map[string]int
+		GetExpectations() map[string][]runtime.GRPCCallExpectation
+	})
+	if ok {
+		httpMux.HandleFunc("/verifications/counts", func(w http.ResponseWriter, r *http.Request) {
+			writeJSONResponse(w, http.StatusOK, typedStore.GetMatchCounts())
+		})
+		httpMux.HandleFunc("/verifications/satisfied", func(w http.ResponseWriter, r *http.Request) {
+			result := make(map[string]bool)
+			counts := typedStore.GetMatchCounts()
+			expectations := typedStore.GetExpectations()
+			for method, exps := range expectations {
+				for idx, exp := range exps {
+					key := fmt.Sprintf("%s#%d", method, idx)
+					count := counts[key]
+					ok := true
+					if exp.Times != nil {
+						if exp.Times.Exact > 0 {
+							ok = count == exp.Times.Exact
+						} else {
+							if exp.Times.Min > 0 && count < exp.Times.Min {
+								ok = false
+							}
+							if exp.Times.Max > 0 && count > exp.Times.Max {
+								ok = false
+							}
+						}
+					}
+					result[key] = ok
+				}
+			}
+			writeJSONResponse(w, http.StatusOK, result)
+		})
+	}
+
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%s", httpPort),
 		Handler: httpMux,

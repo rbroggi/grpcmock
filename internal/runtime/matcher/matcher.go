@@ -34,118 +34,121 @@ func matchesRegex(pattern, text string) bool {
 	return matched
 }
 
-func isNumber(k reflect.Kind) bool {
-	switch k {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
-		return true
-	default:
+// matchField applies a FieldMatcher to a value.
+func matchField(matcher runtime.FieldMatcher, value interface{}) bool {
+	if matcher.Equals != nil && !reflect.DeepEqual(matcher.Equals, value) {
 		return false
+	}
+	if matcher.Regex != "" {
+		strVal, ok := value.(string)
+		if !ok || !matchesRegex(matcher.Regex, strVal) {
+			return false
+		}
+	}
+	if matcher.Contains != nil {
+		strVal, ok := value.(string)
+		substr, ok2 := matcher.Contains.(string)
+		if !ok || !ok2 || !contains(strVal, substr) {
+			return false
+		}
+	}
+	if matcher.Range != nil {
+		floatVal, ok := toFloat64(value)
+		if !ok || floatVal < matcher.Range.Min || floatVal > matcher.Range.Max {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(s, substr string) bool {
+	return len(substr) == 0 || (len(s) >= len(substr) && (s == substr || (len(s) > len(substr) && (contains(s[1:], substr) || contains(s[:len(s)-1], substr)))))
+}
+
+func toFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int, int8, int16, int32, int64:
+		return float64(reflect.ValueOf(v).Int()), true
+	case uint, uint8, uint16, uint32, uint64:
+		return float64(reflect.ValueOf(v).Uint()), true
+	default:
+		return 0, false
 	}
 }
 
-// deepCompare compares expected and actual values.
-// 'exact' means maps and slices must have the same set of elements (keys and length).
-// If 'exact' is false (like a 'contains' match for maps/slices):
-//   - For maps: all keys in 'expected' must be in 'actual' with matching values. 'actual' can have more keys.
-//   - For slices: 'actual' must contain all elements of 'expected' in the same order. 'actual' can be longer.
-//     (For unordered slice contains, more complex logic would be needed).
-func deepCompare(expected, actual interface{}, exact bool) bool {
-	if expected == nil && actual == nil {
-		return true
-	}
-	if expected == nil || actual == nil {
-		// If one is nil but not the other, they aren't equal.
-		// Special case: if expected is an empty map/slice and actual is nil, it might be considered a match for 'contains'.
-		// This depends on desired strictness. For now, let's be strict.
-		return false
-	}
-
-	expVal := reflect.ValueOf(expected)
-	actVal := reflect.ValueOf(actual)
-
-	// Handle potential JSON numbers (float64) vs Go struct numbers (int, etc.)
-	if isNumber(expVal.Kind()) && isNumber(actVal.Kind()) {
-		// Convert both to float64 for comparison to handle type differences from JSON unmarshalling
-		var fExp, fAct float64
-		if expVal.CanFloat() {
-			fExp = expVal.Float()
-		} else if expVal.CanUint() {
-			fExp = float64(expVal.Uint())
-		} else { // Int
-			fExp = float64(expVal.Int())
-		}
-
-		if actVal.CanFloat() {
-			fAct = actVal.Float()
-		} else if actVal.CanUint() {
-			fAct = float64(actVal.Uint())
-		} else { // Int
-			fAct = float64(actVal.Int())
-		}
-		return fExp == fAct
-	}
-
-	if expVal.Kind() != actVal.Kind() {
-		return false
-	}
-
-	switch expVal.Kind() {
-	case reflect.Map:
-		expMap, okE := expected.(map[string]interface{})
-		actMap, okA := actual.(map[string]interface{})
-		if !okE || !okA {
-			return false
-		}
-		if exact && len(expMap) != len(actMap) {
-			return false
-		}
-		for k, vExp := range expMap {
-			vAct, ok := actMap[k]
-			if !ok || !deepCompare(vExp, vAct, exact) { // Recursive call, maintain 'exact' for sub-elements
+// matchHeaders applies HeaderMatcher logic.
+func matchHeaders(expected map[string]runtime.HeaderMatcher, actual metadata.MD) bool {
+	for key, matcher := range expected {
+		vals := actual.Get(key)
+		if matcher.Exists != nil {
+			exists := len(vals) > 0
+			if *matcher.Exists != exists {
 				return false
 			}
 		}
-		return true
-	case reflect.Slice:
-		expSlice, okE := expected.([]interface{})
-		actSlice, okA := actual.([]interface{})
-		if !okE || !okA {
-			return false
-		}
-		if exact && len(expSlice) != len(actSlice) {
-			return false
-		}
-		if !exact && len(expSlice) > len(actSlice) { // Expected slice cannot be larger for a "contains" type match
-			return false
-		}
-		// For slice, 'exact' means elements and order must match.
-		// If !exact, it implies 'actual' must contain 'expected' as an ordered sub-sequence starting at index 0.
-		// For more flexible slice matching (e.g. unordered contains), this needs enhancement.
-		for i, vExp := range expSlice {
-			if i >= len(actSlice) || !deepCompare(vExp, actSlice[i], true) { // Compare elements exactly
+		if matcher.Equals != "" {
+			found := false
+			for _, v := range vals {
+				if v == matcher.Equals {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 		}
-		return true
-	default:
-		return fmt.Sprintf("%v", expected) == fmt.Sprintf("%v", actual)
+		if matcher.Regex != "" {
+			found := false
+			for _, v := range vals {
+				if matchesRegex(matcher.Regex, v) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
 	}
+	return true
+}
+
+// matchBody applies FieldMatcher logic to the request body.
+func matchBody(expected map[string]runtime.FieldMatcher, actual map[string]interface{}) bool {
+	for k, matcher := range expected {
+		v, ok := actual[k]
+		if !ok {
+			return false
+		}
+		if !matchField(matcher, v) {
+			return false
+		}
+	}
+	return true
 }
 
 // Matcher provides expectation matching using a storeInterface.
 type Matcher struct {
-	Store storeInterface
+	Store       storeInterface
+	matchCounts map[string]int // key: expectation hash or index
 }
 
 // New creates a new Matcher with the given store.
 func New(store storeInterface) *Matcher {
-	return &Matcher{Store: store}
+	return &Matcher{Store: store, matchCounts: make(map[string]int)}
 }
 
 // FindMatchingExpectation finds an expectation that matches the given gRPC call details.
-func (m *Matcher) FindMatchingExpectation(fullMethodName string, headers metadata.MD, reqBodyProto proto.Message) *runtime.GRPCCallExpectation {
+func (m *Matcher) FindMatchingExpectation(
+	fullMethodName string,
+	headers metadata.MD,
+	reqBodyProto proto.Message,
+) *runtime.GRPCCallExpectation {
 	expectations := m.Store.GetExpectations()
 
 	reqBodyJSONBytes := []byte("{}") // Default to empty JSON if reqBodyProto is nil or marshalling fails
@@ -159,70 +162,53 @@ func (m *Matcher) FindMatchingExpectation(fullMethodName string, headers metadat
 		}
 	}
 
-	for _, exp := range expectations[fullMethodName] {
-		if exp.RequestMatcher == nil { // Match-any if no specific matcher
-			log.Printf("grpcmockruntime: Matched (any) expectation for %s", fullMethodName)
-			return &exp
-		}
+	var actualBodyMap map[string]interface{}
+	_ = json.Unmarshal(reqBodyJSONBytes, &actualBodyMap)
 
-		// Match Headers
-		headersMatch := true
-		if exp.RequestMatcher.Headers != nil {
-			for key, pattern := range exp.RequestMatcher.Headers {
-				vals := headers.Get(key) // metadata.MD.Get returns a slice of strings
-				if len(vals) == 0 {
-					headersMatch = false
-					break
-				}
-				headerValueMatched := false
-				for _, val := range vals {
-					if matchesRegex(pattern, val) {
-						headerValueMatched = true
-						break
-					}
-				}
-				if !headerValueMatched {
-					headersMatch = false
-					break
-				}
+	for idx, exp := range expectations[fullMethodName] {
+		if exp.RequestMatcher == nil {
+			if m.checkTimes(fullMethodName, idx, &exp) {
+				m.incrementMatch(fullMethodName, idx)
+				return &exp
 			}
+			continue
 		}
-		if !headersMatch {
-			log.Printf("grpcmockruntime: Header mismatch for expectation on %s. Expected: %v, Actual: %v", fullMethodName, exp.RequestMatcher.Headers, headers)
-			continue // Try next expectation
+		if exp.RequestMatcher.Headers != nil && !matchHeaders(exp.RequestMatcher.Headers, headers) {
+			continue
 		}
-
-		// Match Body
-		bodyMatch := true
-		if exp.RequestMatcher.Body != nil {
-			if string(reqBodyJSONBytes) == "{}" && len(exp.RequestMatcher.Body) > 0 {
-				bodyMatch = false
-			} else if string(reqBodyJSONBytes) == `{"error_marshalling_request_body": "true"}` && len(exp.RequestMatcher.Body) > 0 {
-				bodyMatch = false
-			} else {
-				var actualBodyMap map[string]interface{}
-				if err := json.Unmarshal(reqBodyJSONBytes, &actualBodyMap); err != nil {
-					log.Printf("grpcmockruntime: error unmarshalling actual request body JSON for matching call '%s': %v. JSON: %s", fullMethodName, err, string(reqBodyJSONBytes))
-					bodyMatch = false
-				} else {
-					if !deepCompare(exp.RequestMatcher.Body, actualBodyMap, true) {
-						bodyMatch = false
-						log.Printf("grpcmockruntime: Body mismatch for expectation on %s. Expected: %v, Actual (from proto): %v (JSON: %s)", fullMethodName, exp.RequestMatcher.Body, actualBodyMap, string(reqBodyJSONBytes))
-					}
-				}
-			}
+		if exp.RequestMatcher.Body != nil && !matchBody(exp.RequestMatcher.Body, actualBodyMap) {
+			continue
 		}
-
-		if !bodyMatch {
-			continue // Try next expectation
-		}
-
-		if headersMatch && bodyMatch {
-			log.Printf("grpcmockruntime: Matched expectation for %s (Headers: %v, Body: %v)",
-				fullMethodName, headersMatch, bodyMatch)
+		if m.checkTimes(fullMethodName, idx, &exp) {
+			m.incrementMatch(fullMethodName, idx)
 			return &exp
 		}
 	}
-	log.Printf("grpcmockruntime: No matching expectation found for %s. Checked %d expectations.", fullMethodName, len(expectations[fullMethodName]))
 	return nil
+}
+
+// checkTimes checks if the expectation can be matched again based on its Times field.
+func (m *Matcher) checkTimes(fullMethod string, idx int, exp *runtime.GRPCCallExpectation) bool {
+	key := fmt.Sprintf("%s#%d", fullMethod, idx)
+	count := m.matchCounts[key]
+	if exp.Times == nil {
+		return true
+	}
+	if exp.Times.Exact > 0 && count >= exp.Times.Exact {
+		return false
+	}
+	if exp.Times.Max > 0 && count >= exp.Times.Max {
+		return false
+	}
+	return true
+}
+
+func (m *Matcher) incrementMatch(fullMethod string, idx int) {
+	key := fmt.Sprintf("%s#%d", fullMethod, idx)
+	m.matchCounts[key]++
+}
+
+// GetMatchCounts returns the current match counts for all expectations.
+func (m *Matcher) GetMatchCounts() map[string]int {
+	return m.matchCounts
 }

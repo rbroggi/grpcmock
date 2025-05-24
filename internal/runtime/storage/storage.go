@@ -23,6 +23,7 @@ var (
 type Store struct {
 	expectationsStore map[string][]runtime.GRPCCallExpectation
 	recordedCalls     []runtime.RecordedGRPCCall
+	matchCounts       map[string]int // key: fullMethodName#index
 	mu                sync.RWMutex
 }
 
@@ -31,6 +32,7 @@ func New() *Store {
 	return &Store{
 		expectationsStore: make(map[string][]runtime.GRPCCallExpectation),
 		recordedCalls:     make([]runtime.RecordedGRPCCall, 0),
+		matchCounts:       make(map[string]int),
 	}
 }
 
@@ -106,4 +108,23 @@ func (s *Store) GetRecordedCalls() []runtime.RecordedGRPCCall {
 	defer s.mu.RUnlock()
 	// Return a copy
 	return append([]runtime.RecordedGRPCCall(nil), s.recordedCalls...)
+}
+
+// IncrementMatch increments the match count for a given expectation.
+func (s *Store) IncrementMatch(fullMethod string, idx int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := fmt.Sprintf("%s#%d", fullMethod, idx)
+	s.matchCounts[key]++
+}
+
+// GetMatchCounts returns the current match counts for all expectations.
+func (s *Store) GetMatchCounts() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	copy := make(map[string]int, len(s.matchCounts))
+	for k, v := range s.matchCounts {
+		copy[k] = v
+	}
+	return copy
 }

@@ -91,7 +91,7 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 		{{if or .ServerStreaming .ClientStreaming}} return err {{else}} return nil, err {{end}}
 	}
 
-	if len(expectation.Response.Headers) > 0 {
+	if expectation.Response != nil && len(expectation.Response.Headers) > 0 {
 		outgoingMD := metadata.New(expectation.Response.Headers)
 		var headerErr error
 		{{if .ClientStreaming}}
@@ -107,13 +107,28 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 		}
 	}
 
-	if expectation.Response.Error != nil {
+	if expectation.Response != nil && expectation.Response.Error != nil {
 		log.Printf("grpcmock: Returning error for %s: code=%v, msg=%s", fullMethod, expectation.Response.Error.Code, expectation.Response.Error.Message)
 		err = status.Errorf(expectation.Response.Error.Code, expectation.Response.Error.Message)
 		{{if or .ServerStreaming .ClientStreaming}} return err {{else}} return nil, err {{end}}
 	}
 
 	{{if .ServerStreaming}}
+		if expectation.Response != nil && len(expectation.Response.Bodies) > 0 {
+			for _, body := range expectation.Response.Bodies {
+				resp := new({{.OutputType}})
+				if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(body, resp); errUnmarshal != nil {
+					log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
+					return status.Errorf(codes.Internal, "failed to unmarshal mock server stream response: %v", errUnmarshal)
+				}
+				if errSend := stream.Send(resp); errSend != nil {
+					log.Printf("grpcmock: Error sending server stream response for %s: %v", fullMethod, errSend)
+					return errSend
+				}
+			}
+			return nil
+		}
+		// fallback to single Body if Bodies is empty
 		resp := new({{.OutputType}})
 		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
@@ -125,17 +140,22 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 		}
 		return nil
 	{{else if .ClientStreaming}}
-		for {
-			if currentReqProto == nil && firstReqProto == nil {
-                break
-            }
-			_, errLoop := stream.Recv()
-			if errLoop == io.EOF { break }
-			if errLoop != nil {
-				log.Printf("grpcmock: Error receiving subsequent message from client stream for %s: %v", fullMethod, errLoop)
-				return status.Errorf(codes.Internal, "error in client stream: %v", errLoop)
+		// For client streaming, support Stream.ExpectedRequests and Stream.Responses if present
+		if expectation.Stream != nil && len(expectation.Stream.Responses) > 0 {
+			for _, respMsg := range expectation.Stream.Responses {
+				resp := new({{.OutputType}})
+				if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(respMsg.Body, resp); errUnmarshal != nil {
+					log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
+					return status.Errorf(codes.Internal, "failed to unmarshal mock client stream response: %v", errUnmarshal)
+				}
+				if errSend := stream.SendAndClose(resp); errSend != nil {
+					log.Printf("grpcmock: Error sending client stream response for %s: %v", fullMethod, errSend)
+					return errSend
+				}
 			}
+			return nil
 		}
+		// fallback to single Body if Stream.Responses is empty
 		resp := new({{.OutputType}})
 		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
 			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
