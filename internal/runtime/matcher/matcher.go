@@ -6,6 +6,7 @@ import (
 	"log"
 	"reflect"
 	"regexp"
+	"strings"
 
 	"github.com/rbroggi/grpcmock/internal/runtime"
 	"github.com/rbroggi/grpcmock/internal/runtime/storage"
@@ -15,11 +16,9 @@ import (
 
 // storeInterface defines the methods for expectation and call storage.
 type storeInterface interface {
-	AddExpectation(exp runtime.GRPCCallExpectation) error
-	GetExpectations() map[string][]runtime.GRPCCallExpectation
-	ClearAll()
-	RecordCall(fullMethodName string, headers map[string][]string, reqBodyProto proto.Message)
-	GetRecordedCalls() []runtime.RecordedGRPCCall
+	ListExpectations(options runtime.ListExpectationsOptions) []runtime.GRPCCallExpectation
+	IncrementMatch(id string)
+	GetMatches(id string) int
 }
 
 func matchesRegex(pattern, text string) bool {
@@ -34,8 +33,8 @@ func matchesRegex(pattern, text string) bool {
 	return matched
 }
 
-// matchField applies a FieldMatcher to a value.
-func matchField(matcher runtime.FieldMatcher, value interface{}) bool {
+// matchField applies a BodyMatcher to a value.
+func matchField(matcher runtime.BodyMatcher, value interface{}) bool {
 	if matcher.Equals != nil && !reflect.DeepEqual(matcher.Equals, value) {
 		return false
 	}
@@ -80,135 +79,124 @@ func toFloat64(val interface{}) (float64, bool) {
 	}
 }
 
-// matchHeaders applies HeaderMatcher logic.
-func matchHeaders(expected map[string]runtime.HeaderMatcher, actual metadata.MD) bool {
-	for key, matcher := range expected {
+// matchHeaders applies HeadersMatcher logic.
+func matchHeaders(expected *runtime.HeadersMatcher, actual metadata.MD) bool {
+	if expected == nil {
+		return true
+	}
+	for key, fieldMatcher := range expected.HeadersFieldsMatchers {
 		vals := actual.Get(key)
-		if matcher.Exists != nil {
-			exists := len(vals) > 0
-			if *matcher.Exists != exists {
-				return false
+		matched := false
+		for _, v := range vals {
+			if fieldMatcher.Match(v) {
+				matched = true
+				break
 			}
 		}
-		if matcher.Equals != "" {
-			found := false
-			for _, v := range vals {
-				if v == matcher.Equals {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		if matcher.Regex != "" {
-			found := false
-			for _, v := range vals {
-				if matchesRegex(matcher.Regex, v) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
+		if !matched {
+			return false
 		}
 	}
 	return true
 }
 
-// matchBody applies FieldMatcher logic to the request body.
-func matchBody(expected map[string]runtime.FieldMatcher, actual map[string]interface{}) bool {
-	for k, matcher := range expected {
-		v, ok := actual[k]
-		if !ok {
-			return false
-		}
-		if !matchField(matcher, v) {
-			return false
-		}
+// matchBody applies BodyMatcher logic to the request body.
+func matchBody(expected *runtime.BodyMatcher, actual map[string]interface{}) bool {
+	if expected == nil {
+		return true
+	}
+	// For now, only support Equals and Contains for the whole body as string
+	if expected.Equals != nil {
+		return reflect.DeepEqual(expected.Equals, actual)
+	}
+	if expected.Contains != nil {
+		// Only works if both are strings
+		bodyStr, ok1 := actual["body"].(string)
+		containsStr, ok2 := expected.Contains.(string)
+		return ok1 && ok2 && strings.Contains(bodyStr, containsStr)
 	}
 	return true
+}
+
+func matchStrict(actualReqJSON, expected []byte) (bool, error) {
+	var actualReq interface{}
+	if err := json.Unmarshal(actualReqJSON, &actualReq); err != nil {
+		return false, fmt.Errorf("invalid actual request json: %v", err)
+	}
+	var expectedReq interface{}
+	if err := json.Unmarshal(expected, &expectedReq); err != nil {
+		return false, fmt.Errorf("invalid expected request json: %v", err)
+	}
+	return reflect.DeepEqual(expectedReq, actualReq), nil
 }
 
 // Matcher provides expectation matching using a storeInterface.
 type Matcher struct {
-	Store       storeInterface
-	matchCounts map[string]int // key: expectation hash or index
+	Store storeInterface
 }
 
 // New creates a new Matcher with the given store.
 func New(store storeInterface) *Matcher {
-	return &Matcher{Store: store, matchCounts: make(map[string]int)}
+	return &Matcher{Store: store}
 }
 
 // FindMatchingExpectation finds an expectation that matches the given gRPC call details.
+// It returns the matching expectation or nil if none found (with no error).
+// If an error occurs during matching, it returns nil and the error.
 func (m *Matcher) FindMatchingExpectation(
 	fullMethodName string,
 	headers metadata.MD,
 	reqBodyProto proto.Message,
-) *runtime.GRPCCallExpectation {
-	expectations := m.Store.GetExpectations()
+) (*runtime.GRPCCallExpectation, error) {
+	expectations := m.Store.ListExpectations(runtime.ListExpectationsOptions{FullMethodName: fullMethodName})
+	if len(expectations) == 0 {
+		return nil, nil
+	}
 
-	reqBodyJSONBytes := []byte("{}") // Default to empty JSON if reqBodyProto is nil or marshalling fails
-	if reqBodyProto != nil {
-		var err error
-		reqBodyJSONBytes, err = storage.DefaultMarshaler.Marshal(reqBodyProto) // Directly use reqBodyProto
-		if err != nil {
-			log.Printf("grpcmockruntime: error marshalling request body to JSON for matching call '%s': %v", fullMethodName, err)
-			// Proceed with an empty JSON representation of the body on error.
-			reqBodyJSONBytes = []byte(`{"error_marshalling_request_body": "true"}`)
-		}
+	var err error
+	reqBodyJSONBytes, err := storage.DefaultMarshaler.Marshal(reqBodyProto)
+	if err != nil {
+		return nil, err
 	}
 
 	var actualBodyMap map[string]interface{}
-	_ = json.Unmarshal(reqBodyJSONBytes, &actualBodyMap)
+	if err = json.Unmarshal(reqBodyJSONBytes, &actualBodyMap); err != nil {
+		log.Printf("grpcmockruntime: error unmarshalling request body to JSON: %v", err)
+		return nil, err
+	}
 
-	for idx, exp := range expectations[fullMethodName] {
-		if exp.RequestMatcher == nil {
-			if m.checkTimes(fullMethodName, idx, &exp) {
-				m.incrementMatch(fullMethodName, idx)
-				return &exp
-			}
-			continue
-		}
-		if exp.RequestMatcher.Headers != nil && !matchHeaders(exp.RequestMatcher.Headers, headers) {
-			continue
-		}
-		if exp.RequestMatcher.Body != nil && !matchBody(exp.RequestMatcher.Body, actualBodyMap) {
-			continue
-		}
-		if m.checkTimes(fullMethodName, idx, &exp) {
-			m.incrementMatch(fullMethodName, idx)
-			return &exp
+	for _, exp := range expectations {
+		matcher := exp.RequestMatcher
+		if matcher == nil ||
+			(matcher.HeadersMatcher == nil || matchHeaders(matcher.HeadersMatcher, headers)) &&
+				(matcher.BodyMatcher == nil || matchBody(matcher.BodyMatcher, actualBodyMap)) {
+			m.Store.IncrementMatch(exp.ID)
+			return &exp, nil
 		}
 	}
-	return nil
+
+	if b, err := json.MarshalIndent(expectations, "", "  "); err == nil {
+		log.Printf("grpcmockruntime: no matching expectation found. Unmatched expectations for method %s: \n%s", fullMethodName, string(b))
+	} else {
+		log.Printf("grpcmockruntime: failed to marshal unmatched expectations: %v", err)
+	}
+	return nil, nil
 }
 
-// checkTimes checks if the expectation can be matched again based on its Times field.
-func (m *Matcher) checkTimes(fullMethod string, idx int, exp *runtime.GRPCCallExpectation) bool {
-	key := fmt.Sprintf("%s#%d", fullMethod, idx)
-	count := m.matchCounts[key]
-	if exp.Times == nil {
-		return true
+func (m *Matcher) VerifyExpectation(id string) (bool, error) {
+	expectations := m.Store.ListExpectations(runtime.ListExpectationsOptions{FullMethodName: id})
+	if len(expectations) == 0 {
+		return false, runtime.ErrNotFound
 	}
-	if exp.Times.Exact > 0 && count >= exp.Times.Exact {
-		return false
-	}
-	if exp.Times.Max > 0 && count >= exp.Times.Max {
-		return false
+	return expectations[0].ExpectedCalledTimes.IsSatisfied(m.Store.GetMatches(id)), nil
+}
+
+func (m *Matcher) VerifyAll() bool {
+	expectations := m.Store.ListExpectations(runtime.ListExpectationsOptions{})
+	for _, exp := range expectations {
+		if !exp.ExpectedCalledTimes.IsSatisfied(m.Store.GetMatches(exp.ID)) {
+			return false
+		}
 	}
 	return true
-}
-
-func (m *Matcher) incrementMatch(fullMethod string, idx int) {
-	key := fmt.Sprintf("%s#%d", fullMethod, idx)
-	m.matchCounts[key]++
-}
-
-// GetMatchCounts returns the current match counts for all expectations.
-func (m *Matcher) GetMatchCounts() map[string]int {
-	return m.matchCounts
 }

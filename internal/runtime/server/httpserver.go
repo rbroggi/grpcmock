@@ -7,16 +7,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rbroggi/grpcmock/internal/runtime"
+	"github.com/rbroggi/grpcmock/internal/runtime/storage"
 )
 
 // storeInterface defines the methods that a store should implement.
 type storeInterface interface {
-	AddExpectation(exp runtime.GRPCCallExpectation) error
-	GetExpectations() map[string][]runtime.GRPCCallExpectation
-	GetRecordedCalls() []runtime.RecordedGRPCCall
+	CreateExpectation(exp runtime.GRPCCallExpectation) (string, error)
+	ListExpectations() []runtime.GRPCCallExpectation
+	GetMatchCountByID(id string) int
 	ClearAll()
 }
 
@@ -41,6 +43,14 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 	httpMux.HandleFunc("/expectations", func(w http.ResponseWriter, r *http.Request) {
 		handleExpectations(w, r, store)
 	})
+	httpMux.HandleFunc("/expectations/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/expectations/")
+		handleExpectationByID(w, r, store, id)
+	})
+	httpMux.HandleFunc("/verifications/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/verifications/")
+		handleVerificationByID(w, r, store, id)
+	})
 	httpMux.HandleFunc("/verifications", func(w http.ResponseWriter, r *http.Request) {
 		handleVerifications(w, r, store)
 	})
@@ -48,7 +58,7 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 	// Add endpoints for match counts and satisfaction verification
 	typedStore, ok := store.(interface {
 		GetMatchCounts() map[string]int
-		GetExpectations() map[string][]runtime.GRPCCallExpectation
+		ListExpectations() map[string][]runtime.GRPCCallExpectation
 	})
 	if ok {
 		httpMux.HandleFunc("/verifications/counts", func(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +67,7 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 		httpMux.HandleFunc("/verifications/satisfied", func(w http.ResponseWriter, r *http.Request) {
 			result := make(map[string]bool)
 			counts := typedStore.GetMatchCounts()
-			expectations := typedStore.GetExpectations()
+			expectations := typedStore.ListExpectations()
 			for method, exps := range expectations {
 				for idx, exp := range exps {
 					key := fmt.Sprintf("%s#%d", method, idx)
@@ -116,13 +126,19 @@ func handleExpectations(w http.ResponseWriter, r *http.Request, store storeInter
 			writeErrorResponse(w, http.StatusBadRequest, "Failed to decode expectation", err)
 			return
 		}
-		if err := store.AddExpectation(exp); err != nil {
+		id, err := store.CreateExpectation(exp)
+		if err != nil {
+			if errors.Is(err, storage.ErrAlreadyExist) {
+				w.WriteHeader(http.StatusConflict)
+				writeJSONResponse(w, http.StatusConflict, map[string]string{"id": id, "error": err.Error()})
+				return
+			}
 			writeErrorResponse(w, http.StatusBadRequest, "Invalid expectation", err)
 			return
 		}
-		writeJSONResponse(w, http.StatusCreated, map[string]string{"message": "Expectation added"})
+		writeJSONResponse(w, http.StatusCreated, map[string]string{"id": id})
 	case http.MethodGet:
-		writeJSONResponse(w, http.StatusOK, store.GetExpectations())
+		writeJSONResponse(w, http.StatusOK, store.ListExpectations())
 	case http.MethodDelete:
 		store.ClearAll() // Clears both expectations and recorded calls
 		writeJSONResponse(w, http.StatusOK, map[string]string{"message": "All expectations and recorded calls cleared"})
@@ -135,8 +151,38 @@ func handleExpectations(w http.ResponseWriter, r *http.Request, store storeInter
 func handleVerifications(w http.ResponseWriter, r *http.Request, store storeInterface) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSONResponse(w, http.StatusOK, store.GetRecordedCalls())
+		writeJSONResponse(w, http.StatusOK, map[string]string{"message": "recorded calls feature removed"})
 	default:
 		writeErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 	}
+}
+
+// handleExpectationByID manages HTTP requests for retrieving a specific expectation by ID.
+func handleExpectationByID(w http.ResponseWriter, r *http.Request, store storeInterface, id string) {
+	exps := store.ListExpectations()
+	if exp, ok := exps[id]; ok {
+		writeJSONResponse(w, http.StatusOK, exp)
+		return
+	}
+	writeErrorResponse(w, http.StatusNotFound, "Expectation not found", nil)
+}
+
+// handleVerificationByID manages HTTP requests for retrieving match count and satisfaction for an expectation by ID.
+func handleVerificationByID(w http.ResponseWriter, r *http.Request, store storeInterface, id string) {
+	exps := store.ListExpectations()
+	exp, ok := exps[id]
+	if !ok {
+		writeErrorResponse(w, http.StatusNotFound, "Expectation not found", nil)
+		return
+	}
+	count := store.GetMatchCountByID(id)
+	satisfied := true
+	if exp.ExpectedCalledTimes != nil {
+		satisfied = exp.ExpectedCalledTimes.IsSatisfied(count)
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"id":         id,
+		"matchCount": count,
+		"satisfied":  satisfied,
+	})
 }

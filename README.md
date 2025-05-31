@@ -196,6 +196,10 @@ make build
 5. Run the generated server: `go run ./out/grpcmock/company_services/server.go` (or `make run-example-server`).
 6. Write test clients (gRPC and HTTP) to interact with the running mock server.
 
+## Development Tips
+
+* See the [debug plugin code generate with buf](./docs/debug-plugin-code-generation-with-buf.md) for tips on debugging the plugin code generation process.
+
 ### Future Enhancements
 * More sophisticated request body matchers (contains, regex per field, JSONPath, ignoring extra fields).
 * Advanced expectation conditions (e.g., call count, call order).

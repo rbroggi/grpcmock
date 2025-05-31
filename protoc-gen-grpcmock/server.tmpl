@@ -84,7 +84,11 @@ func (s *{{$service.MockServerStructName}}) {{.GoName}}(
 
 	expectationsStore.RecordCall(fullMethod, incomingMD, currentReqProto)
 
-	expectation := expectationsMatcher.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
+	expectation, err := expectationsMatcher.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
+	if err != nil {
+		log.Printf("grpcmock: Error finding matching expectation for %s: %v", fullMethod, err)
+		return nil, status.Errorf(codes.Internal, "error finding matching expectation: %v", err)
+	}
 
 	if expectation == nil {
 		err = status.Errorf(codes.Unimplemented, "no matching expectation for %s", fullMethod)

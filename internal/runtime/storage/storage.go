@@ -1,15 +1,14 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
 	"sync"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/rbroggi/grpcmock/internal/runtime"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -17,114 +16,113 @@ var (
 	DefaultMarshaler = protojson.MarshalOptions{EmitUnpopulated: true}
 	// DefaultUnmarshaler can be configured if needed
 	DefaultUnmarshaler = protojson.UnmarshalOptions{DiscardUnknown: true}
+	// ErrAlreadyExist is returned when an expectation with the same ID already exists.
+	ErrAlreadyExist = fmt.Errorf("expectation already exists")
 )
 
 // Store holds expectations and recorded calls in memory.
 type Store struct {
-	expectationsStore map[string][]runtime.GRPCCallExpectation
-	recordedCalls     []runtime.RecordedGRPCCall
-	matchCounts       map[string]int // key: fullMethodName#index
-	mu                sync.RWMutex
+	expectationsByID map[string]*runtime.GRPCCallExpectation // id -> expectation
+	matchCounts      map[string]int                          // key: expectation ID
+	mu               sync.RWMutex
 }
 
 // New creates a new Store instance.
 func New() *Store {
 	return &Store{
-		expectationsStore: make(map[string][]runtime.GRPCCallExpectation),
-		recordedCalls:     make([]runtime.RecordedGRPCCall, 0),
-		matchCounts:       make(map[string]int),
+		expectationsByID: make(map[string]*runtime.GRPCCallExpectation),
+		matchCounts:      make(map[string]int),
 	}
 }
 
-// AddExpectation adds a new gRPC call expectation.
-func (s *Store) AddExpectation(exp runtime.GRPCCallExpectation) error {
+// CreateExpectation adds a new gRPC call expectation, returns its ID or ErrAlreadyExist.
+func (s *Store) CreateExpectation(exp runtime.GRPCCallExpectation) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if exp.FullMethodName == "" {
-		return fmt.Errorf("fullMethodName is required in expectation")
+		return "", fmt.Errorf("fullMethodName is required in expectation")
 	}
-	if exp.Response == nil {
-		return fmt.Errorf("response is required in expectation")
+	if exp.Response == nil && exp.StreamMock == nil {
+		return "", fmt.Errorf("response or streamMock is required in expectation")
 	}
-	s.expectationsStore[exp.FullMethodName] = append(s.expectationsStore[exp.FullMethodName], exp)
-	log.Printf("grpcmockruntime: Added expectation for %s", exp.FullMethodName)
-	return nil
-}
-
-// GetExpectations returns all current expectations.
-func (s *Store) GetExpectations() map[string][]runtime.GRPCCallExpectation {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	// Return a copy to avoid external modification issues if the caller modifies the map/slice
-	copiedExpectations := make(map[string][]runtime.GRPCCallExpectation)
-	for k, v := range s.expectationsStore {
-		copiedExpectations[k] = append([]runtime.GRPCCallExpectation(nil), v...)
-	}
-	return copiedExpectations
-}
-
-// ClearAll clears all expectations and recorded calls.
-func (s *Store) ClearAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.expectationsStore = make(map[string][]runtime.GRPCCallExpectation)
-	s.recordedCalls = make([]runtime.RecordedGRPCCall, 0)
-	log.Println("grpcmockruntime: All expectations and recorded calls cleared.")
-}
-
-// RecordCall records an incoming gRPC call.
-// It now correctly uses proto.Message with protojson.Marshal.
-func (s *Store) RecordCall(fullMethodName string, headers map[string][]string, reqBodyProto proto.Message) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var reqBodyJSON json.RawMessage = []byte("{}") // Default to empty JSON if reqBodyProto is nil or marshalling fails
-
-	if reqBodyProto != nil {
-		bytes, err := DefaultMarshaler.Marshal(reqBodyProto) // Directly use reqBodyProto (which is proto.Message)
-		if err != nil {
-			// Log the error but still proceed to record the call, possibly with an empty or error indicator in the body
-			log.Printf("grpcmockruntime: error marshalling request body to JSON for recording call '%s': %v", fullMethodName, err)
-			// Optionally, you could store an error message in reqBodyJSON or a separate field
-			errorMsg := fmt.Sprintf(`{"error_marshalling_request_body": "%s"}`, err.Error())
-			reqBodyJSON = json.RawMessage(errorMsg)
-		} else {
-			reqBodyJSON = json.RawMessage(bytes)
+	// Check for identical expectation
+	for _, existing := range s.expectationsByID {
+		if expectationsEqual(existing, &exp) {
+			return existing.ID, ErrAlreadyExist
 		}
 	}
-
-	s.recordedCalls = append(s.recordedCalls, runtime.RecordedGRPCCall{
-		FullMethodName: fullMethodName,
-		Headers:        headers,
-		Body:           reqBodyJSON,
-		Timestamp:      time.Now().UnixNano(),
-	})
-	log.Printf("grpcmockruntime: Recorded call to %s", fullMethodName) // Optional: for verbose logging
+	// Assign a new UUID
+	exp.ID = uuid.NewString()
+	s.expectationsByID[exp.ID] = &exp
+	log.Printf("grpcmockruntime: Added expectation for %s with id %s", exp.FullMethodName, exp.ID)
+	return exp.ID, nil
 }
 
-// GetRecordedCalls returns all recorded calls.
-func (s *Store) GetRecordedCalls() []runtime.RecordedGRPCCall {
+// GetExpectationByID returns the expectation by its ID.
+func (s *Store) GetExpectationByID(id string) (*runtime.GRPCCallExpectation, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// Return a copy
-	return append([]runtime.RecordedGRPCCall(nil), s.recordedCalls...)
+	exp, ok := s.expectationsByID[id]
+	return exp, ok
 }
 
-// IncrementMatch increments the match count for a given expectation.
-func (s *Store) IncrementMatch(fullMethod string, idx int) {
+// ListExpectations returns all expectations, optionally filtered by options.
+func (s *Store) ListExpectations(opts runtime.ListExpectationsOptions) []runtime.GRPCCallExpectation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []runtime.GRPCCallExpectation
+	for _, exp := range s.expectationsByID {
+		if opts.FullMethodName != "" && exp.FullMethodName != opts.FullMethodName {
+			continue
+		}
+		result = append(result, *exp)
+	}
+	return result
+}
+
+// DeleteExpectation removes an expectation by its ID. Returns true if deleted, false if not found.
+func (s *Store) DeleteExpectation(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := fmt.Sprintf("%s#%d", fullMethod, idx)
-	s.matchCounts[key]++
+	if _, ok := s.expectationsByID[id]; ok {
+		delete(s.expectationsByID, id)
+		delete(s.matchCounts, id)
+		return true
+	}
+	return false
 }
 
-// GetMatchCounts returns the current match counts for all expectations.
-func (s *Store) GetMatchCounts() map[string]int {
+// ClearExpectations removes all expectations and their match counts from the store.
+func (s *Store) ClearExpectations() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expectationsByID = make(map[string]*runtime.GRPCCallExpectation)
+	s.matchCounts = make(map[string]int)
+}
+
+// IncrementMatch increments the match count for a given expectation ID.
+func (s *Store) IncrementMatch(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.matchCounts[id]++
+}
+
+// GetMatches returns the match count for a given expectation ID.
+func (s *Store) GetMatches(id string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	copy := make(map[string]int, len(s.matchCounts))
-	for k, v := range s.matchCounts {
-		copy[k] = v
+	return s.matchCounts[id]
+}
+
+// expectationsEqual checks if two GRPCCallExpectation are identical (ignoring ID and ExpectedCalledTimes).
+func expectationsEqual(a, b *runtime.GRPCCallExpectation) bool {
+	if a == nil || b == nil {
+		return false
 	}
-	return copy
+	aCopy := *a
+	bCopy := *b
+	aCopy.ID = ""
+	bCopy.ID = ""
+	aCopy.ExpectedCalledTimes = nil
+	return reflect.DeepEqual(aCopy, bCopy)
 }
