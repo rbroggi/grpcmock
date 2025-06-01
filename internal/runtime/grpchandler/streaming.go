@@ -26,12 +26,12 @@ import (
 
 // StreamHandler handles all types of gRPC streaming calls.
 type StreamHandler struct {
-	matcherService matching.Service
+	matcherService matcherService
 	storageService store
 }
 
 // NewStreamHandler creates a new StreamHandler.
-func NewStreamHandler(m matching.Service, s store) *StreamHandler {
+func NewStreamHandler(m matcherService, s store) *StreamHandler {
 	return &StreamHandler{matcherService: m, storageService: s}
 }
 

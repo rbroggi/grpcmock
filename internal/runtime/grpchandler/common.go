@@ -1,13 +1,26 @@
 package grpchandler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 
+	"github.com/rbroggi/grpcmock/internal/runtime/core"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
+
+type matcherService interface {
+	FindMatchingExpectation(
+		ctx context.Context,
+		fullMethodName string,
+		headers metadata.MD,
+		requestBody proto.Message,
+		streamType core.ExpectationType,
+	) (*core.Expectation, int, error)
+}
 
 // ConvertProtoToMap converts a proto.Message to map[string]interface{} using protojson.
 // This is used to get a comparable representation of the actual request body.

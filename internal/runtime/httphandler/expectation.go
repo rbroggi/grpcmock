@@ -15,89 +15,84 @@ import (
 	"github.com/rbroggi/grpcmock/internal/runtime/storage"
 )
 
+// expectationStore defines the methods from storage.Store needed by expectation handlers.
 type expectationStore interface {
 	CreateExpectation(ctx context.Context, exp *core.Expectation) error
+	GetExpectation(ctx context.Context, id string) (*core.Expectation, error)
 	ListExpectations(ctx context.Context, fullMethodNameFilter string) ([]*core.Expectation, error)
+	DeleteExpectation(ctx context.Context, id string) error
 	ClearAllExpectations(ctx context.Context) error
-	ClearAllMatchCounts(ctx context.Context) error
+	ClearAllMatchCounts(ctx context.Context) error // Match counts are related
 }
 
-// Expectation handles HTTP requests for managing expectations.
-type Expectation struct {
+// ExpectationHandler handles HTTP requests for managing expectations.
+type ExpectationHandler struct {
 	store expectationStore
 }
 
-// NewExpectationHandler creates a new Expectation.
-func NewExpectationHandler(s expectationStore) *Expectation {
-	return &Expectation{store: s}
+// NewExpectationHandler creates a new ExpectationHandler.
+func NewExpectationHandler(s expectationStore) *ExpectationHandler {
+	return &ExpectationHandler{store: s}
 }
 
-// ServeHTTP routes requests to appropriate handlers.
-// Base path: /expectations
-func (h *Expectation) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP routes requests for /expectations and /expectations/{id}.
+func (h *ExpectationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	trimmedPath := strings.TrimPrefix(r.URL.Path, "/expectations")
-	trimmedPath = strings.Trim(trimmedPath, "/")
-
-	// Routing:
-	// POST /expectations -> Create
-	// GET  /expectations -> List
-	// DELETE /expectations -> ClearAll
-	// GET /expectations/{id} -> GetByID
-	// DELETE /expectations/{id} -> DeleteByID
-	// PUT /expectations/{id} -> UpdateByID (optional)
+	id := strings.Trim(trimmedPath, "/")
 
 	switch r.Method {
 	case http.MethodPost:
-		if trimmedPath == "" {
+		if id == "" { // POST /expectations
 			h.handleCreateExpectation(w, r)
 		} else {
-			writeErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed for this path")
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "POST not allowed for /expectations/{id}")
 		}
 	case http.MethodGet:
-		if trimmedPath == "" {
+		if id == "" { // GET /expectations
 			h.handleListExpectations(w, r)
-		} else {
-			// Potentially /expectations/{id}
-			// h.handleGetExpectationByID(w, r, trimmedPath)
-			writeErrorResponse(w, http.StatusNotFound, "Specific expectation GET not yet implemented or path invalid")
+		} else { // GET /expectations/{id}
+			h.handleGetExpectationByID(w, r, id)
 		}
 	case http.MethodDelete:
-		if trimmedPath == "" {
+		if id == "" { // DELETE /expectations
 			h.handleClearAllExpectations(w, r)
-		} else {
-			// Potentially /expectations/{id} for deleting one
-			// h.handleDeleteExpectationByID(w, r, trimmedPath)
-			writeErrorResponse(w, http.StatusNotFound, "Specific expectation DELETE not yet implemented or path invalid")
+		} else { // DELETE /expectations/{id}
+			h.handleDeleteExpectationByID(w, r, id)
 		}
+		// case http.MethodPut: // PUT /expectations/{id}
+		// 	if id != "" {
+		// 		// h.handleUpdateExpectation(w, r, id) // TODO: Implement if needed
+		// 	} else {
+		// 		writeErrorResponse(w, http.StatusMethodNotAllowed, "PUT requires an expectation ID")
+		// 	}
 	default:
 		writeErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
 }
 
-func (h *Expectation) handleCreateExpectation(w http.ResponseWriter, r *http.Request) {
-	var apiExp api.GRPCCallExpectation
-	if err := json.NewDecoder(r.Body).Decode(&apiExp); err != nil {
+func (h *ExpectationHandler) handleCreateExpectation(w http.ResponseWriter, r *http.Request) {
+	var apiExp api.GRPCCallExpectation                              //
+	if err := json.NewDecoder(r.Body).Decode(&apiExp); err != nil { //
 		writeErrorResponse(w, http.StatusBadRequest, "Failed to decode expectation JSON", err.Error())
 		return
 	}
 
-	coreExp, err := acl.ToInternalExpectation(&apiExp)
+	coreExp, err := acl.ToInternalExpectation(&apiExp) //
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, "Invalid expectation data", err.Error())
 		return
 	}
 
-	if err := h.store.CreateExpectation(r.Context(), coreExp); err != nil {
-		if errors.Is(err, storage.ErrAlreadyExists) {
-			// Extract the ID from the error message if possible, or use the input ID
+	if err := h.store.CreateExpectation(r.Context(), coreExp); err != nil { //
+		if errors.Is(err, storage.ErrAlreadyExists) { //
 			errMsg := err.Error()
 			var existingID string
-			if _, scanErr := fmt.Sscanf(errMsg, "functionally identical expectation already exists with ID '%s'", &existingID); scanErr == nil {
+			if _, scanErr := fmt.Sscanf(errMsg, "functionally identical expectation already exists with ID '%s'", &existingID); scanErr == nil { //
 				writeJSONResponse(w, http.StatusConflict, map[string]string{"id": existingID, "error": "Functionally identical expectation already exists"})
-			} else if _, scanErr := fmt.Sscanf(errMsg, "expectation with ID '%s' already exists", &existingID); scanErr == nil {
+			} else if _, scanErr := fmt.Sscanf(errMsg, "expectation with ID '%s' already exists", &existingID); scanErr == nil { //
 				writeJSONResponse(w, http.StatusConflict, map[string]string{"id": existingID, "error": "Expectation with this ID already exists"})
 			} else {
-				writeErrorResponse(w, http.StatusConflict, "Expectation already exists", err.Error())
+				writeErrorResponse(w, http.StatusConflict, "Expectation already exists or is functionally identical.", err.Error())
 			}
 			return
 		}
@@ -106,11 +101,10 @@ func (h *Expectation) handleCreateExpectation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSONResponse(w, http.StatusCreated, api.CreateExpectationResponse{ID: coreExp.ID})
+	writeJSONResponse(w, http.StatusCreated, api.CreateExpectationResponse{ID: coreExp.ID}) //
 }
 
-func (h *Expectation) handleListExpectations(w http.ResponseWriter, r *http.Request) {
-	// Optional: filter by fullMethodName query param
+func (h *ExpectationHandler) handleListExpectations(w http.ResponseWriter, r *http.Request) {
 	fullMethodNameFilter := r.URL.Query().Get("fullMethodName")
 
 	coreExps, err := h.store.ListExpectations(r.Context(), fullMethodNameFilter)
@@ -120,14 +114,12 @@ func (h *Expectation) handleListExpectations(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	apiExps := make([]*api.GRPCCallExpectation, 0, len(coreExps))
+	apiExps := make([]*api.GRPCCallExpectation, 0, len(coreExps)) //
 	for _, coreExp := range coreExps {
-		apiExp, err := acl.ToAPIExpectation(coreExp)
-		if err != nil {
-			log.Printf("httphandler: Error translating core expectation to API DTO (ID: %s): %v", coreExp.ID, err)
-			// Skip this one in the response or return an error for the whole list?
-			// For now, skip.
-			continue
+		apiExp, errConv := acl.ToAPIExpectation(coreExp) //
+		if errConv != nil {
+			log.Printf("httphandler: Error translating core expectation to API DTO (ID: %s): %v", coreExp.ID, errConv)
+			continue //
 		}
 		apiExps = append(apiExps, apiExp)
 	}
@@ -135,20 +127,58 @@ func (h *Expectation) handleListExpectations(w http.ResponseWriter, r *http.Requ
 	writeJSONResponse(w, http.StatusOK, apiExps)
 }
 
-func (h *Expectation) handleClearAllExpectations(w http.ResponseWriter, r *http.Request) {
+func (h *ExpectationHandler) handleClearAllExpectations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if err := h.store.ClearAllExpectations(ctx); err != nil {
+	if err := h.store.ClearAllExpectations(ctx); err != nil { //
 		log.Printf("httphandler: Error clearing all expectations: %v", err)
 		writeErrorResponse(w, http.StatusInternalServerError, "Failed to clear all expectations", err.Error())
 		return
 	}
-	// Also clear match counts when all expectations are cleared.
-	if err := h.store.ClearAllMatchCounts(ctx); err != nil {
+	if err := h.store.ClearAllMatchCounts(ctx); err != nil { //
 		log.Printf("httphandler: Error clearing all match counts: %v", err)
-		// Non-fatal for the expectations clear operation
+		// Non-fatal for the expectations clear operation itself
 	}
-
 	writeJSONResponse(w, http.StatusOK, map[string]string{"message": "All expectations cleared successfully"})
 }
 
-// TODO: Implement handleGetExpectationByID, handleDeleteExpectationByID, handleUpdateExpectationByID
+func (h *ExpectationHandler) handleGetExpectationByID(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeErrorResponse(w, http.StatusBadRequest, "Expectation ID is required in path")
+		return
+	}
+	coreExp, err := h.store.GetExpectation(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) { //
+			writeErrorResponse(w, http.StatusNotFound, "Expectation not found", err.Error())
+		} else {
+			log.Printf("httphandler: Error getting expectation %s: %v", id, err)
+			writeErrorResponse(w, http.StatusInternalServerError, "Failed to retrieve expectation", err.Error())
+		}
+		return
+	}
+	apiExp, errConv := acl.ToAPIExpectation(coreExp) //
+	if errConv != nil {
+		log.Printf("httphandler: Error translating core expectation to API DTO for GetByID (ID: %s): %v", coreExp.ID, errConv)
+		writeErrorResponse(w, http.StatusInternalServerError, "Failed to process expectation data", errConv.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, apiExp)
+}
+
+func (h *ExpectationHandler) handleDeleteExpectationByID(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeErrorResponse(w, http.StatusBadRequest, "Expectation ID is required in path")
+		return
+	}
+	err := h.store.DeleteExpectation(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) { //
+			writeErrorResponse(w, http.StatusNotFound, "Expectation not found for deletion", err.Error())
+		} else {
+			log.Printf("httphandler: Error deleting expectation %s: %v", id, err)
+			writeErrorResponse(w, http.StatusInternalServerError, "Failed to delete expectation", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("Expectation %s deleted successfully", id)})
+}

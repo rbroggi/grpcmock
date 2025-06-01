@@ -35,7 +35,7 @@ func (s *Service) FindMatchingExpectation(
 	ctx context.Context,
 	fullMethodName string,
 	headers metadata.MD,
-	requestBody proto.Message, // Can be nil for streams without initial body
+	requestBody proto.Message,
 	streamType core.ExpectationType,
 ) (*core.Expectation, int, error) {
 

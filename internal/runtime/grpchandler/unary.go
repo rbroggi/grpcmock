@@ -7,7 +7,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rbroggi/grpcmock/internal/runtime/core"
-	"github.com/rbroggi/grpcmock/internal/runtime/matching"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -21,12 +20,12 @@ type store interface {
 
 // UnaryHandler handles unary gRPC calls.
 type UnaryHandler struct {
-	matcherService matching.Service
+	matcherService matcherService
 	storageService store
 }
 
 // NewUnaryHandler creates a new UnaryHandler.
-func NewUnaryHandler(m matching.Service, s store) *UnaryHandler {
+func NewUnaryHandler(m matcherService, s store) *UnaryHandler {
 	return &UnaryHandler{matcherService: m, storageService: s}
 }
 
@@ -43,7 +42,7 @@ func (h *UnaryHandler) Handle(
 	log.Printf("grpchandler-unary: Received call to %s", fullMethodName)
 
 	// 1. Attempt to find a matching expectation
-	expectation, matchCountSoFar, err := h.matcherService.FindMatchingExpectation(
+	expectation, _, err := h.matcherService.FindMatchingExpectation(
 		ctx,
 		fullMethodName,
 		incomingMD,
@@ -90,7 +89,15 @@ func (h *UnaryHandler) Handle(
 	}
 
 	// 3. Record the successful call
-	recordSuccessfulCall(ctx, h.storageService, fullMethodName, core.ExpectationUnary, incomingMD, requestProto, expectation.ID)
+	recordSuccessfulCall(
+		ctx,
+		h.storageService,
+		fullMethodName,
+		core.ExpectationUnary,
+		incomingMD,
+		requestProto,
+		expectation.ID,
+	)
 
 	// 4. Prepare and return response from expectation's ResponseAction
 	action := expectation.ResponseAction
@@ -114,7 +121,15 @@ func (h *UnaryHandler) Handle(
 	return action.Body, responseHeaders, nil
 }
 
-func recordSuccessfulCall(ctx context.Context, store store, fullMethod, callType core.ExpectationType, md metadata.MD, reqBodyProto proto.Message, expectationID string) {
+func recordSuccessfulCall(
+	ctx context.Context,
+	store store,
+	fullMethodName string,
+	callType core.ExpectationType,
+	md metadata.MD,
+	reqBodyProto proto.Message,
+	expectationID string,
+) {
 	if store == nil {
 		return
 	}
@@ -126,7 +141,7 @@ func recordSuccessfulCall(ctx context.Context, store store, fullMethod, callType
 	call := &core.RecordedCall{
 		ID:             uuid.NewString(),
 		ExpectationID:  expectationID,
-		FullMethodName: fullMethod,
+		FullMethodName: fullMethodName,
 		Type:           callType,
 		Headers:        md.Copy(), // Make a copy of metadata
 		RequestBody:    reqMap,

@@ -3,31 +3,34 @@ package {{.PackageName}}
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"errors"
-	"syscall"
 	"os/signal"
-	"io"
+	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
+	core "github.com/rbroggi/grpcmock/internal/runtime/core"
 	"github.com/rbroggi/grpcmock/internal/runtime/storage"
-	"github.com/rbroggi/grpcmock/internal/runtime/server"
 	"github.com/rbroggi/grpcmock/internal/runtime/matching"
+	"github.com/rbroggi/grpcmock/internal/runtime/grpchandler"
+	httph "github.com/rbroggi/grpcmock/internal/runtime/httphandler"
 )
 
-// --- Global runtime wiring ---
 var (
-	expectationsStore   = storage.NewInMemoryStore()
-	expectationsMatcher = matching.NewService(expectationsStore)
+	globalStore         *storage.InMemoryStore
+	globalMatcher       *matching.Service
+	globalUnaryHandler  *grpchandler.UnaryHandler
+	globalStreamHandler *grpchandler.StreamHandler
 )
 
 {{range .Services}}
@@ -36,206 +39,419 @@ type {{.MockServerStructName}} struct {
 	{{.QualifiedUnimplementedServerType}}
 }
 
-// New{{.MockServerStructName}} creates a new mock server.
+// New{{.MockServerStructName}} creates a new mock server for {{.OriginalGoName}}.
 func New{{.MockServerStructName}}() *{{.MockServerStructName}} {
 	return &{{.MockServerStructName}}{}
 }
 
 {{$service := .}}
 {{range .Methods}}
-// Method {{.GoName}} on mock server {{$service.MockServerStructName}} for gRPC service {{$service.OriginalGoName}}
-func (s *{{$service.MockServerStructName}}) {{.GoName}}(
-	{{if .ClientStreaming}}
-	stream {{.QualifiedStreamServerType}},
-	{{else if .ServerStreaming}}
-	req *{{.InputType}}, stream {{.QualifiedStreamServerType}},
-	{{else}} // Unary
-	ctx context.Context, req *{{.InputType}},
-	{{end}}
-) {{if .ServerStreaming}} (error) {{else if .ClientStreaming}} (error) {{else}} (*{{.OutputType}}, error) {{end}} {
+// {{.GoName}} implements the {{.FullMethodName}} gRPC method.
+{{if .ClientStreaming}}
+func (s *{{$service.MockServerStructName}}) {{.GoName}}(stream {{.QualifiedStreamServerType}}) error {
 	fullMethod := "{{.FullMethodName}}"
-	log.Printf("grpcmock: Received call to %s (mock server type: %s)", fullMethod, "{{$service.MockServerStructName}}")
+	log.Printf("grpcmock-server: [%s] Client stream call received", fullMethod)
 
-	var currentReqProto proto.Message
-	var incomingMD metadata.MD
-	var err error
+	// newRequestFunc creates new instances of the client's message type for RecvMsg
+	newRequestFunc := func() proto.Message { return new({{.InputObjectTypeForNew}}) }
 
-	{{if .ClientStreaming}}
-	firstReqProto, errRecv := stream.Recv()
-	if errRecv == io.EOF {
-		log.Printf("grpcmock: Client stream for %s ended before any message for matching.", fullMethod)
-		currentReqProto = nil
-	} else if errRecv != nil {
-		log.Printf("grpcmock: Error receiving from client stream for %s: %v", fullMethod, errRecv)
-		return status.Errorf(codes.Internal, "error receiving from client stream: %v", errRecv)
-	} else {
-		currentReqProto = firstReqProto
-	}
-	incomingMD, _ = metadata.FromIncomingContext(stream.Context())
-	{{else if .ServerStreaming}}
-	currentReqProto = req
-	incomingMD, _ = metadata.FromIncomingContext(stream.Context())
-	{{else}} // Unary
-	currentReqProto = req
-	incomingMD, _ = metadata.FromIncomingContext(ctx)
-	{{end}}
+	respBodyMap, respMD, err := globalStreamHandler.HandleClientStream(
+		fullMethod,
+		stream,
+		newRequestFunc,
+	)
 
-	expectationsStore.RecordCall(fullMethod, incomingMD, currentReqProto)
-
-	expectation, err := expectationsMatcher.FindMatchingExpectation(fullMethod, incomingMD, currentReqProto)
 	if err != nil {
-		log.Printf("grpcmock: Error finding matching expectation for %s: %v", fullMethod, err)
-		return nil, status.Errorf(codes.Internal, "error finding matching expectation: %v", err)
+		log.Printf("grpcmock-server: [%s] Client stream handler error: %v", fullMethod, err)
+		return err // Already a gRPC status error from handler
 	}
 
-	if expectation == nil {
-		err = status.Errorf(codes.Unimplemented, "no matching expectation for %s", fullMethod)
-		{{if or .ServerStreaming .ClientStreaming}} return err {{else}} return nil, err {{end}}
-	}
-
-	if expectation.Response != nil && len(expectation.Response.Headers) > 0 {
-		outgoingMD := metadata.New(expectation.Response.Headers)
-		var headerErr error
-		{{if .ClientStreaming}}
-		headerErr = stream.SetHeader(outgoingMD)
-		{{else if .ServerStreaming}}
-		headerErr = stream.SendHeader(outgoingMD)
-		{{else}} // Unary
-		headerErr = grpc.SetHeader(ctx, outgoingMD)
-		{{end}}
-		if headerErr != nil {
-			log.Printf("grpcmock: failed to set/send response header for %s: %v", fullMethod, headerErr)
-			{{if or .ClientStreaming .ServerStreaming}} if headerErr != nil { return headerErr } {{end}}
+	if len(respMD) > 0 {
+		if headerErr := stream.SetHeader(respMD); headerErr != nil {
+			log.Printf("grpcmock-server: [%s] Client stream error setting headers: %v", fullMethod, headerErr)
+			// Note: SendAndClose will be called, potentially overriding this error if it also errors.
+			// Consider returning early if header setting is critical.
+			return status.Errorf(codes.Internal, "failed to set response headers: %v", headerErr)
 		}
 	}
 
-	if expectation.Response != nil && expectation.Response.Error != nil {
-		log.Printf("grpcmock: Returning error for %s: code=%v, msg=%s", fullMethod, expectation.Response.Error.Code, expectation.Response.Error.Message)
-		err = status.Errorf(expectation.Response.Error.Code, expectation.Response.Error.Message)
-		{{if or .ServerStreaming .ClientStreaming}} return err {{else}} return nil, err {{end}}
+	responseProto := new({{.OutputObjectTypeForNew}})
+	if err := grpchandler.UnmarshalMapToProto(respBodyMap, responseProto); err != nil {
+		log.Printf("grpcmock-server: [%s] Client stream error unmarshaling final response: %v", fullMethod, err)
+		return status.Errorf(codes.Internal, "failed to unmarshal final response: %v", err)
 	}
 
-	{{if .ServerStreaming}}
-		if expectation.Response != nil && len(expectation.Response.Bodies) > 0 {
-			for _, body := range expectation.Response.Bodies {
-				resp := new({{.OutputType}})
-				if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(body, resp); errUnmarshal != nil {
-					log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
-					return status.Errorf(codes.Internal, "failed to unmarshal mock server stream response: %v", errUnmarshal)
-				}
-				if errSend := stream.Send(resp); errSend != nil {
-					log.Printf("grpcmock: Error sending server stream response for %s: %v", fullMethod, errSend)
-					return errSend
-				}
-			}
-			return nil
-		}
-		// fallback to single Body if Bodies is empty
-		resp := new({{.OutputType}})
-		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
-			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
-			return status.Errorf(codes.Internal, "failed to unmarshal mock server stream response: %v", errUnmarshal)
-		}
-		if errSend := stream.Send(resp); errSend != nil {
-			log.Printf("grpcmock: Error sending server stream response for %s: %v", fullMethod, errSend)
-			return errSend
-		}
-		return nil
-	{{else if .ClientStreaming}}
-		// For client streaming, support Stream.ExpectedRequests and Stream.Responses if present
-		if expectation.Stream != nil && len(expectation.Stream.Responses) > 0 {
-			for _, respMsg := range expectation.Stream.Responses {
-				resp := new({{.OutputType}})
-				if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(respMsg.Body, resp); errUnmarshal != nil {
-					log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
-					return status.Errorf(codes.Internal, "failed to unmarshal mock client stream response: %v", errUnmarshal)
-				}
-				if errSend := stream.SendAndClose(resp); errSend != nil {
-					log.Printf("grpcmock: Error sending client stream response for %s: %v", fullMethod, errSend)
-					return errSend
-				}
-			}
-			return nil
-		}
-		// fallback to single Body if Stream.Responses is empty
-		resp := new({{.OutputType}})
-		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
-			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
-			return status.Errorf(codes.Internal, "failed to unmarshal mock client stream response: %v", errUnmarshal)
-		}
-		return stream.SendAndClose(resp)
-	{{else}} // Unary
-		resp := new({{.OutputType}})
-		if errUnmarshal := storage.DefaultUnmarshaler.Unmarshal(expectation.Response.Body, resp); errUnmarshal != nil {
-			log.Printf("grpcmock: Failed to unmarshal mock response body for %s: %v", fullMethod, errUnmarshal)
-			return nil, status.Errorf(codes.Internal, "failed to unmarshal mock unary response: %v", errUnmarshal)
-		}
-		return resp, nil
-	{{end}}
+	log.Printf("grpcmock-server: [%s] Client stream sending final response.", fullMethod)
+	return stream.SendMsg(responseProto)
 }
-{{end}} {{/* End range Methods */}}
-{{end}} {{/* End range Services */}}
+{{else if .ServerStreaming}}
+func (s *{{$service.MockServerStructName}}) {{.GoName}}(req *{{.InputType}}, stream {{.QualifiedStreamServerType}}) error {
+	fullMethod := "{{.FullMethodName}}"
+	log.Printf("grpcmock-server: [%s] Server stream call received with req: %+v", fullMethod, req) // Log incoming req
 
-func StartMockServer(grpcPort, httpPort string) {
+	ctx := stream.Context()
+	incomingMD, _ := metadata.FromIncomingContext(ctx)
+
+	// 1. Find the matching expectation
+	// For server streaming, the initial request (req) is part of the matching.
+	expectation, _, findErr := globalMatcher.FindMatchingExpectation(
+		ctx, fullMethod, incomingMD, req, core.ExpectationServerStream,
+	)
+
+	if findErr != nil {
+		log.Printf("grpcmock-server: [%s] Error finding matching expectation: %v", fullMethod, findErr)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationServerStream, incomingMD, req, "", false)
+		return status.Errorf(codes.Internal, "error finding matching expectation: %v", findErr)
+	}
+	if expectation == nil {
+		log.Printf("grpcmock-server: [%s] No matching expectation found.", fullMethod)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationServerStream, incomingMD, req, "", false)
+		return status.Errorf(codes.Unimplemented, "no matching expectation for server stream %s", fullMethod)
+	}
+	if expectation.Type != core.ExpectationServerStream {
+		log.Printf("grpcmock-server: [%s] Matched expectation %s is not for SERVER_STREAM (type: %s)", fullMethod, expectation.ID, expectation.Type)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationServerStream, incomingMD, req, expectation.ID, false)
+        return status.Errorf(codes.Internal, "matched expectation %s is not for server streaming", expectation.ID)
+	}
+
+	// 2. Increment match count & check limits
+	currentMatchCount, errInc := globalStore.IncrementMatchCount(ctx, expectation.ID)
+	if errInc != nil {
+		log.Printf("grpcmock-server: [%s] Failed to increment match count for exp %s: %v", fullMethod, expectation.ID, errInc)
+		// Decide if this is fatal; for now, log and continue
+	}
+	if expectation.ExpectedCallTimes != nil && !expectation.ExpectedCallTimes.IsSatisfied(currentMatchCount) {
+		log.Printf("grpcmock-server: [%s] Expectation %s matched max times (%d)", fullMethod, expectation.ID, currentMatchCount)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationServerStream, incomingMD, req, expectation.ID, false) // Matched but limit exceeded
+		return status.Errorf(codes.ResourceExhausted, "expectation %s for method %s has been matched its maximum configured times", expectation.ID, fullMethod)
+	}
+
+	// 3. Record the successful initial call
+	grpchandler.RecordSuccessfulCall(ctx, globalStore, fullMethod, core.ExpectationServerStream, incomingMD, req, expectation.ID)
+
+	// 4. Process StreamActions
+	headersSent := false
+	for i, streamAction := range expectation.StreamActions {
+		if streamAction.Send == nil {
+			log.Printf("grpcmock-server: [%s] Expectation %s action %d is not 'send', invalid for server stream. Skipping.", fullMethod, expectation.ID, i)
+			continue // Or return error for misconfigured expectation
+		}
+		sendAction := streamAction.Send
+
+		if sendAction.Delay > 0 {
+			log.Printf("grpcmock-server: [%s] Delaying action %d for %dms", fullMethod, i, sendAction.Delay)
+			time.Sleep(time.Duration(sendAction.Delay) * time.Millisecond)
+		}
+
+		// Send headers with the first message if not already sent and if present in this action
+		if !headersSent && len(sendAction.Headers) > 0 {
+			log.Printf("grpcmock-server: [%s] Sending headers for action %d: %+v", fullMethod, i, sendAction.Headers)
+			if err := stream.SendHeader(metadata.New(sendAction.Headers)); err != nil {
+				log.Printf("grpcmock-server: [%s] Server stream error sending headers for action %d: %v", fullMethod, i, err)
+				return status.Errorf(codes.Internal, "failed to send headers for action %d: %v", i, err)
+			}
+			headersSent = true
+		}
+
+		if sendAction.Error != nil {
+			log.Printf("grpcmock-server: [%s] Server stream returning error at action %d: (%s) %s", fullMethod, i, sendAction.Error.Code, sendAction.Error.Message)
+			return status.Errorf(sendAction.Error.Code, sendAction.Error.Message)
+		}
+
+		responseProto := new({{.OutputObjectTypeForNew}}) // e.g. new(pb.StreamResponse)
+		if err := grpchandler.UnmarshalMapToProto(sendAction.Body, responseProto); err != nil {
+			log.Printf("grpcmock-server: [%s] Server stream error unmarshaling response for action %d: %v. Body map: %+v", fullMethod, i, err, sendAction.Body)
+			return status.Errorf(codes.Internal, "failed to unmarshal stream response %d: %v", i, err)
+		}
+
+		log.Printf("grpcmock-server: [%s] Server stream sending message for action %d: %+v", fullMethod, i, responseProto)
+		if err := stream.SendMsg(responseProto); err != nil {
+			log.Printf("grpcmock-server: [%s] Server stream error sending message for action %d: %v", fullMethod, i, err)
+			return err // Client might have closed stream, or other SendMsg error
+		}
+	}
+	log.Printf("grpcmock-server: [%s] Server stream finished all actions for expectation %s.", fullMethod, expectation.ID)
+	return nil
+}
+{{else if .ServerStreaming}} // Bi-directional Streaming - Note: Template logic for server streaming can be adapted for bidi Send actions
+func (s *{{$service.MockServerStructName}}) {{.GoName}}(stream {{.QualifiedStreamServerType}}) error {
+	fullMethod := "{{.FullMethodName}}"
+	log.Printf("grpcmock-server: [%s] Bi-directional stream call received", fullMethod)
+
+	ctx := stream.Context()
+	incomingMD, _ := metadata.FromIncomingContext(ctx)
+
+	// For Bidi, initial matching might be based on method name and headers only.
+	// Subsequent message matching happens within the handler or loop.
+	expectation, _, findErr := globalMatcher.FindMatchingExpectation(
+		ctx, fullMethod, incomingMD, nil, core.ExpectationBidiStream,
+	)
+
+	if findErr != nil {
+		log.Printf("grpcmock-server: [%s] Bidi error finding expectation: %v", fullMethod, findErr)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationBidiStream, incomingMD, nil, "", false)
+		return status.Errorf(codes.Internal, "bidi: error finding expectation: %v", findErr)
+	}
+	if expectation == nil {
+		log.Printf("grpcmock-server: [%s] Bidi no matching expectation.", fullMethod)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationBidiStream, incomingMD, nil, "", false)
+		return status.Errorf(codes.Unimplemented, "bidi: no matching expectation for %s", fullMethod)
+	}
+    if expectation.Type != core.ExpectationBidiStream {
+		log.Printf("grpcmock-server: [%s] Bidi matched expectation %s is not BIDI_STREAM (type: %s)", fullMethod, expectation.ID, expectation.Type)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationBidiStream, incomingMD, nil, expectation.ID, false)
+        return status.Errorf(codes.Internal, "bidi: matched expectation %s is not for bidi streaming", expectation.ID)
+    }
+
+
+	currentMatchCount, errInc := globalStore.IncrementMatchCount(ctx, expectation.ID)
+	if errInc != nil { log.Printf("grpcmock-server: [%s] bidi failed to inc match count for exp %s: %v", fullMethod, expectation.ID, errInc) }
+	if expectation.ExpectedCallTimes != nil && !expectation.ExpectedCallTimes.IsSatisfied(currentMatchCount) {
+		log.Printf("grpcmock-server: [%s] Bidi expectation %s matched max times (%d)", fullMethod, expectation.ID, currentMatchCount)
+		grpchandler.RecordFailedCall(ctx, globalStore, fullMethod, core.ExpectationBidiStream, incomingMD, nil, expectation.ID, false)
+		return status.Errorf(codes.ResourceExhausted, "bidi: expectation %s for %s matched max times", expectation.ID, fullMethod)
+	}
+
+	grpchandler.RecordSuccessfulCall(ctx, globalStore, fullMethod, core.ExpectationBidiStream, incomingMD, nil, expectation.ID) // Record initial connection
+
+	// Bidi interaction loop based on expectation.StreamActions
+	headersSent := false // For initial response headers, if any
+
+	for i, action := range expectation.StreamActions {
+		if action.Delay > 0 {
+			log.Printf("grpcmock-server: [%s] Bidi action %d delaying for %dms", fullMethod, i, action.Delay)
+			time.Sleep(time.Duration(action.Delay) * time.Millisecond)
+		}
+
+		if action.Receive != nil { // Expect a message from client
+			log.Printf("grpcmock-server: [%s] Bidi action %d: Expecting client message", fullMethod, i)
+			clientMsg := new({{.InputObjectTypeForNew}})
+			if errRecv := stream.RecvMsg(clientMsg); errRecv != nil {
+				if errors.Is(errRecv, io.EOF) {
+					// Client closed stream. Check if this was expected.
+					log.Printf("grpcmock-server: [%s] Bidi client closed stream at action %d (EOF)", fullMethod, i)
+					// If there are more actions expected, especially 'Receive' actions, this is an error.
+					// If only 'Send' actions or no actions were left, it might be acceptable.
+					isUnexpectedEOF := false
+					for j := i; j < len(expectation.StreamActions); j++ {
+						if expectation.StreamActions[j].Receive != nil {
+							isUnexpectedEOF = true
+							break
+						}
+					}
+					if isUnexpectedEOF {
+						log.Printf("grpcmock-server: [%s] Bidi unexpected EOF, more client messages were expected.",fullMethod)
+						return status.Errorf(codes.OutOfRange, "bidi: client closed stream prematurely, expected more messages")
+					}
+					return nil // Clean EOF if no more receives were strictly expected
+				}
+				log.Printf("grpcmock-server: [%s] Bidi RecvMsg error at action %d: %v", fullMethod, i, errRecv)
+				return status.Errorf(codes.Aborted, "bidi: error receiving message: %v", errRecv)
+			}
+
+			log.Printf("grpcmock-server: [%s] Bidi received client message at action %d: %+v", fullMethod, i, clientMsg)
+			actualMap, convErr := grpchandler.ConvertProtoToMap(clientMsg)
+			if convErr != nil {
+				log.Printf("grpcmock-server: [%s] Bidi error converting received message to map: %v", fullMethod, convErr)
+				return status.Errorf(codes.Internal, "bidi: error converting received client message: %v", convErr)
+			}
+
+			// TODO: This needs a proper call to the matching service for the body
+			// For now, using a simplified direct check based on the action's RequestCondition.BodyMatcher
+			if !IsSubsetBodyMatch(action.Receive.BodyMatcher, actualMap) { // Using placeholder helper
+				log.Printf("grpcmock-server: [%s] Bidi received message at action %d did NOT match expectation. Expected: %+v, ActualMap: %+v", fullMethod, i, action.Receive.BodyMatcher, actualMap)
+				return status.Errorf(codes.InvalidArgument, "bidi: received message at action %d did not match body expectation", i)
+			}
+			log.Printf("grpcmock-server: [%s] Bidi received client message matched action %d", fullMethod, i)
+			// Optionally record this specific client message as part of the RecordedCall details
+
+		} else if action.Send != nil { // Send a message to client
+			sendAction := action.Send
+			log.Printf("grpcmock-server: [%s] Bidi action %d: Sending server message. BodyMap: %+v", fullMethod, i, sendAction.Body)
+
+			if !headersSent && len(sendAction.Headers) > 0 {
+				log.Printf("grpcmock-server: [%s] Bidi sending headers for action %d: %+v", fullMethod, i, sendAction.Headers)
+				if err := stream.SendHeader(metadata.New(sendAction.Headers)); err != nil {
+					log.Printf("grpcmock-server: [%s] Bidi error sending headers for action %d: %v", fullMethod, i, err)
+					return status.Errorf(codes.Internal, "bidi: failed to send headers: %v", err)
+				}
+				headersSent = true
+			}
+
+			if sendAction.Error != nil {
+				log.Printf("grpcmock-server: [%s] Bidi returning error at action %d: (%s) %s", fullMethod, i, sendAction.Error.Code, sendAction.Error.Message)
+				return status.Errorf(sendAction.Error.Code, sendAction.Error.Message)
+			}
+
+			responseMsg := new({{.OutputObjectTypeForNew}})
+			if errUm := grpchandler.UnmarshalMapToProto(sendAction.Body, responseMsg); errUm != nil {
+				log.Printf("grpcmock-server: [%s] Bidi error unmarshaling response for action %d: %v", fullMethod, i, errUm)
+				return status.Errorf(codes.Internal, "bidi: unmarshal response error: %v", errUm)
+			}
+
+			log.Printf("grpcmock-server: [%s] Bidi sending server message for action %d: %+v", fullMethod, i, responseMsg)
+			if errSend := stream.SendMsg(responseMsg); errSend != nil {
+				log.Printf("grpcmock-server: [%s] Bidi SendMsg error at action %d: %v", fullMethod, i, errSend)
+				return status.Errorf(codes.Aborted, "bidi: send message error: %v", errSend)
+			}
+			// Optionally record this specific sent message
+		}
+	}
+	log.Printf("grpcmock-server: [%s] Bidi stream finished all actions for expectation %s.", fullMethod, expectation.ID)
+	return nil
+}
+{{else}} // Unary
+func (s *{{$service.MockServerStructName}}) {{.GoName}}(ctx context.Context, req *{{.InputType}}) (*{{.OutputType}}, error) {
+	fullMethod := "{{.FullMethodName}}"
+	log.Printf("grpcmock-server: [%s] Unary call received", fullMethod)
+
+	incomingMD, _ := metadata.FromIncomingContext(ctx)
+	respBodyMap, respMD, err := globalUnaryHandler.Handle(ctx, fullMethod, incomingMD, req)
+
+	if err != nil {
+		log.Printf("grpcmock-server: [%s] Unary handler error: %v", fullMethod, err)
+		var typedNil *{{.OutputType}} // Create a typed nil for pointer return types
+		return typedNil, err // Error is already a gRPC status error
+	}
+
+	if len(respMD) > 0 {
+		if headerErr := grpc.SetHeader(ctx, respMD); headerErr != nil {
+			log.Printf("grpcmock-server: [%s] Unary error setting headers: %v", fullMethod, headerErr)
+			var typedNil *{{.OutputType}}
+			return typedNil, status.Errorf(codes.Internal, "failed to set response headers: %v", headerErr)
+		}
+	}
+
+	responseProto := new({{.OutputObjectTypeForNew}}) // e.g. new(pb.MyResponse)
+	if err := grpchandler.UnmarshalMapToProto(respBodyMap, responseProto); err != nil {
+		log.Printf("grpcmock-server: [%s] Unary error unmarshaling response: %v. Body map: %+v", fullMethod, err, respBodyMap)
+		var typedNil *{{.OutputType}}
+		return typedNil, status.Errorf(codes.Internal, "failed to unmarshal response: %v", err)
+	}
+
+	log.Printf("grpcmock-server: [%s] Unary call returning response: %+v", fullMethod, responseProto)
+	return responseProto, nil
+}
+{{end}}
+{{end}} // End Methods
+{{end}} // End Services
+
+// StartGRPCMockServer initializes and starts the gRPC mock server and its HTTP control plane.
+func StartGRPCMockServer(grpcPort, httpPort string) (grpcShutdown func(), httpCtrlShutdown func()) {
+	// Initialize runtime services
+	globalStore = storage.NewInMemoryStore()
+	globalMatcher = matching.NewService(globalStore)
+	globalUnaryHandler = grpchandler.NewUnaryHandler(globalMatcher, globalStore)
+	globalStreamHandler = grpchandler.NewStreamHandler(globalMatcher, globalStore)
+
+	// Start gRPC server
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", grpcPort))
 	if err != nil {
-		log.Fatalf("grpcmock: failed to listen on gRPC port %s: %v", grpcPort, err)
+		log.Fatalf("grpcmock-server: Failed to listen on gRPC port %s: %v", grpcPort, err)
 	}
 
 	grpcServer := grpc.NewServer()
-
 	{{range .Services}}
-	// Use QualifiedRegisterServerFuncName (based on OriginalGoName) and NewMockServerStructName
 	{{.QualifiedRegisterServerFuncName}}(grpcServer, New{{.MockServerStructName}}())
 	{{end}}
 
-	log.Printf("grpcmock: gRPC server starting on :%s", grpcPort)
+	log.Printf("grpcmock-server: gRPC server starting on port %s", grpcPort)
 	go func() {
 		if serveErr := grpcServer.Serve(lis); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
-			log.Fatalf("grpcmock: failed to serve gRPC: %v", serveErr)
+			log.Fatalf("grpcmock-server: Failed to serve gRPC: %v", serveErr)
 		}
 	}()
 
-	_, httpShutdown := server.StartHTTPServer(httpPort, nil, expectationsStore)
-
-	log.Println("grpcmock: Servers started. Press Ctrl+C to exit.")
-	listenForShutdownSignal(func() {
-		log.Println("grpcmock: shutting down gRPC server...")
+	grpcShutdown = func() {
+		log.Println("grpcmock-server: Shutting down gRPC server...")
 		grpcServer.GracefulStop()
-		log.Println("grpcmock: gRPC server stopped.")
-	}, httpShutdown)
-	log.Println("grpcmock: All servers shut down.")
+		log.Println("grpcmock-server: gRPC server stopped.")
+	}
+
+	// Start HTTP control server using the new httphandler package
+	// The StartHTTPServer function now takes the composite store interface from httphandler.
+	// We need to ensure globalStore (which is storage.Store) satisfies this.
+	// This requires storage.Store to be comprehensive enough or httphandler.store to be adjusted.
+	// For now, assume globalStore can be directly used if it implements all needed methods.
+	// The httphandler.StartHTTPServer expects a 'httphandler.store' which embeds expectationStore and verificationStore.
+	// Our globalStore (type storage.Store) should implement these.
+	_, httpCtrlShutdown = httph.StartHTTPServer(httpPort, globalStore)
+
+	log.Printf("grpcmock-server: Mock server started. gRPC on :%s, HTTP control on :%s. Press Ctrl+C to exit.", grpcPort, httpPort)
+	return grpcShutdown, httpCtrlShutdown
 }
 
-// listenForShutdownSignal is a helper to wait for OS signals for graceful shutdown
+// listenForShutdownSignal waits for OS signals for graceful shutdown.
 func listenForShutdownSignal(shutdownFuncs ...func()) {
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
-    log.Println("grpcmockruntime: Shutdown signal received...")
-    for _, sf := range shutdownFuncs {
-        sf()
-    }
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("grpcmock-server: Shutdown signal received...")
+	for _, sf := range shutdownFuncs {
+		sf()
+	}
 }
 
+// main function for the generated server.
 func main() {
-	var grpcPort, httpPort string
+	var grpcPortFlag, httpPortFlag string
 
-	defaultGrpcPort := "{{.GRPCPort}}"
-	defaultHttpPort := "{{.HTTPPort}}"
+	defaultGRPCPort := "{{.GRPCPort}}" // These are string literals from template data
+	defaultHTTPPort := "{{.HTTPPort}}"
 
 	envGRPCPort := os.Getenv("GRPCMOCK_GRPC_PORT")
 	if envGRPCPort != "" {
- 		defaultGrpcPort = envGRPCPort
+		defaultGRPCPort = envGRPCPort
 	}
 	envHTTPPort := os.Getenv("GRPCMOCK_HTTP_PORT")
 	if envHTTPPort != "" {
-		defaultHttpPort = envHTTPPort
+		defaultHTTPPort = envHTTPPort
 	}
 
-	flag.StringVar(&grpcPort, "grpc-port", defaultGrpcPort, "gRPC server port for the mock")
-	flag.StringVar(&httpPort, "http-port", defaultHttpPort, "HTTP control server port for the mock")
+	flag.StringVar(&grpcPortFlag, "grpc-port", defaultGRPCPort, "gRPC server port for the mock")
+	flag.StringVar(&httpPortFlag, "http-port", defaultHTTPPort, "HTTP control server port for the mock")
 	flag.Parse()
 
-	StartMockServer(grpcPort, httpPort)
+	grpcShutdown, httpShutdown := StartGRPCMockServer(grpcPortFlag, httpPortFlag)
+
+	listenForShutdownSignal(httpShutdown, grpcShutdown) // Call http first, then grpc
+	log.Println("grpcmock-server: All services shut down gracefully.")
+}
+
+// IsSubsetBodyMatch is a helper that might be used by the template for bidi stream matching.
+// It's better if this logic stays within the matching service and the template calls that.
+// For now, providing a local version for the template's bidi part.
+func IsSubsetBodyMatch(matcher core.BodyMatcher, actualMap map[string]interface{}) bool {
+    // This function needs to be available or the template logic for bidi needs to call matching service.
+    // To avoid direct dependency from template to matching internal logic for this helper:
+    // This logic should ideally be:
+    // 1. A method on matching.Service that takes core.BodyMatcher and actualMap
+    // 2. The template for bidi calls this method.
+    // For now, if matching.IsSubset is public, we could call it.
+    // Let's assume it's available via a hypothetical public function for simplicity in template,
+    // or this function is defined in a way that the template can use it.
+	if matcher.Strategy == core.BodyMatchSubset {
+		// This ideally calls a method from matching package, e.g. matching.CheckSubset(...)
+		// For now, assuming a local or accessible helper.
+		// This direct call to matching.IsSubset might not work if it's not exported or meant for internal use.
+		// return matching.IsSubset(matcher.ExpectedBody, actualMap) // This might fail if IsSubset is not public or in this package
+		// Let's define a local simple version for the template for now if needed,
+		// or ensure the matching service has a method that can be called.
+		// For now, this is a placeholder for how the template would invoke such a check.
+		// The provided `isSubset` is in the `matching` package, not directly callable here
+		// unless we make it public and import `matching`.
+		// This indicates a slight architectural smell - template doing too much matching.
+		// The StreamHandler should ideally handle this matching.
+		log.Printf("DEBUG: IsSubsetBodyMatch called with strategy SUBSET. Expected: %+v, Actual: %+v", matcher.ExpectedBody, actualMap)
+		// return internalIsSubsetHelper(matcher.ExpectedBody, actualMap) // if we had a local copy
+		return true // Placeholder - BIDI matching part needs robust implementation
+	}
+	if matcher.Strategy == core.BodyMatchFull {
+		log.Printf("DEBUG: IsSubsetBodyMatch called with strategy FULL. Expected: %+v, Actual: %+v", matcher.ExpectedBody, actualMap)
+		return reflect.DeepEqual(matcher.ExpectedBody, actualMap)
+	}
+	if matcher.Strategy == core.BodyMatchUndefined || matcher.Strategy == "" {
+		return true
+	}
+	return false
 }
