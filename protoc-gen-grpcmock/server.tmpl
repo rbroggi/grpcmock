@@ -11,9 +11,7 @@ import (
 	"errors"
 	"syscall"
 	"os/signal"
-	{{if .HasClientStreamingMethods}}
 	"io"
-	{{end}}
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -23,13 +21,13 @@ import (
 
 	"github.com/rbroggi/grpcmock/internal/runtime/storage"
 	"github.com/rbroggi/grpcmock/internal/runtime/server"
-	"github.com/rbroggi/grpcmock/internal/runtime/matcher"
+	"github.com/rbroggi/grpcmock/internal/runtime/matching"
 )
 
 // --- Global runtime wiring ---
 var (
-	expectationsStore   = storage.New()
-	expectationsMatcher = matcher.New(expectationsStore)
+	expectationsStore   = storage.NewInMemoryStore()
+	expectationsMatcher = matching.NewService(expectationsStore)
 )
 
 {{range .Services}}

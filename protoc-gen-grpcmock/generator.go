@@ -1,7 +1,7 @@
 package main
 
 import (
-	_ "embed"
+	_ "embed" // Required for go:embed
 	"fmt"
 	"log"
 	"strings"
@@ -10,192 +10,163 @@ import (
 	"google.golang.org/protobuf/compiler/protogen"
 )
 
-// TemplateData holds all data passed to the server template for code generation.
-type TemplateData struct {
-	Filename                  string        // Name of the generated file
-	PackageName               string        // Go package name for the generated file
-	Services                  []ServiceData // All services to mock
-	HTTPPort                  string        // HTTP port for the mock server
-	GRPCPort                  string        // gRPC port for the mock server
-	HasClientStreamingMethods bool          // True if any service has client streaming methods
-}
-
-// ServiceData holds information about a single gRPC service for code generation.
-type ServiceData struct {
-	OriginalGoName                   string       // Original Go service name, e.g., "CustomerService"
-	MockServerStructName             string       // Unique mock struct name, e.g., "CustomerServiceMockServer" or "CustomerServiceMockServer2"
-	QualifiedUnimplementedServerType string       // Fully qualified UnimplementedServer type
-	QualifiedRegisterServerFuncName  string       // Fully qualified RegisterServer function
-	Methods                          []MethodData // Methods of the service
-}
-
-// MethodData holds information about a single gRPC method for code generation.
-type MethodData struct {
-	Name                      string // Original method name
-	GoName                    string // Go method name
-	InputType                 string // Fully qualified input type
-	OutputType                string // Fully qualified output type
-	ClientStreaming           bool   // True if client streaming
-	ServerStreaming           bool   // True if server streaming
-	FullMethodName            string // Full gRPC method name
-	QualifiedStreamServerType string // Fully qualified stream server type (if streaming)
-}
-
 //go:embed server.tmpl
 var serverTemplateContent string
 
-// pendingService is a helper struct for the first pass of service collection.
-type pendingService struct {
-	file    *protogen.File
-	service *protogen.Service
+// TemplateData holds all data passed to the server template for code generation.
+type TemplateData struct {
+	PackageName string // Go package name for the generated file (e.g., "main")
+	Services    []ServiceData
+	HTTPPort    string // Default HTTP port
+	GRPCPort    string // Default gRPC port
 }
 
-// countServiceNames counts occurrences of each service Go name across all files.
-func countServiceNames(files []*protogen.File) map[string]int {
-	counts := make(map[string]int)
-	for _, file := range files {
-		if !file.Generate || len(file.Services) == 0 {
-			continue
-		}
-		for _, service := range file.Services {
-			counts[service.GoName]++
-		}
-	}
-	return counts
+// ServiceData holds information about a single gRPC service.
+type ServiceData struct {
+	OriginalGoName                   string // e.g., "CustomerService"
+	MockServerStructName             string // e.g., "CustomerServiceGrpcmockServer"
+	QualifiedUnimplementedServerType string // e.g., "pb.UnimplementedCustomerServiceServer"
+	QualifiedRegisterServerFuncName  string // e.g., "pb.RegisterCustomerServiceServer"
+	Methods                          []MethodData
 }
 
-// collectPendingServices collects all services to be processed.
-func collectPendingServices(files []*protogen.File) []pendingService {
-	var pending []pendingService
-	for _, file := range files {
-		if !file.Generate || len(file.Services) == 0 {
-			continue
-		}
-		for _, service := range file.Services {
-			pending = append(pending, pendingService{file: file, service: service})
-		}
-	}
-	return pending
-}
+// MethodData holds information about a single gRPC method.
+type MethodData struct {
+	GoName                    string // Method name in Go (e.g., "GetDetails")
+	FullMethodName            string // Full gRPC method name (e.g., "/package.Service/Method")
+	InputType                 string // Fully qualified Go type for input (e.g., "*pb.GetCustomerDetailsRequest")
+	OutputType                string // Fully qualified Go type for output (e.g., "*pb.GetCustomerDetailsResponse")
+	ClientStreaming           bool
+	ServerStreaming           bool
+	QualifiedStreamServerType string // e.g. "pb.UserService_ListUsersServer" - if streaming
+	// Used in template to create new instances for RecvMsg for client streaming
+	// and for UnmarshalMapToProto for server streaming responses.
+	InputObjectTypeForNew  string // e.g. "pb.MyRequest" (without pointer) for new(pb.MyRequest)
+	OutputObjectTypeForNew string // e.g. "pb.MyResponse" (without pointer) for new(pb.MyResponse)
 
-// hasClientStreaming checks if any method in the services is client streaming.
-func hasClientStreaming(services []ServiceData) bool {
-	for _, svc := range services {
-		for _, m := range svc.Methods {
-			if m.ClientStreaming {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func generateMockServer(
-	gen *protogen.Plugin,
+	plugin *protogen.Plugin,
 	outputFilename, targetPackageName, httpPort, grpcPort string,
 ) error {
 	if targetPackageName == "" {
-		targetPackageName = "main"
+		targetPackageName = "main" // Default package
 	}
-	g := gen.NewGeneratedFile(outputFilename, protogen.GoImportPath(targetPackageName))
 
-	serviceGoNameCounts := countServiceNames(gen.Files)
-	pendingServices := collectPendingServices(gen.Files)
-	if len(pendingServices) == 0 {
-		log.Println("grpcmock: No services found in .proto files to generate a mock server.")
+	// The output path for the single server file is relative to the `out` dir specified in buf.gen.yaml
+	// E.g. if out is "gen/grpcmock", then this file is "gen/grpcmock/grpcmockserver.go"
+	// The import path within this file will be relative to its location if it's not main.
+	// For simplicity, if targetPackageName is "main", GoImportPath can be ".".
+	// If targetPackageName is something else, e.g. "custommock", the GoImportPath might be
+	// more complex if the generated file is deep in a directory structure.
+	// Let's assume protoc-gen-grpcmock generates a single file at the root of its `out` path for now.
+	var goImportPath protogen.GoImportPath
+	if targetPackageName == "main" {
+		goImportPath = "." // Indicates current package
+	} else {
+		// If users specify a package name like "foo", and output is "gen/grpcmock",
+		// the file will be "gen/grpcmock/grpcmockserver.go" in package "foo".
+		// The import path for types within this generated package itself is just the package name.
+		// This needs to be robust. For now, assume the generated file `outputFilename`
+		// directly defines `targetPackageName`.
+		// The GoImportPath for protogen.GeneratedFile refers to the import path of the package
+		// *being generated*.
+		goImportPath = protogen.GoImportPath(targetPackageName)
+	}
+
+	g := plugin.NewGeneratedFile(outputFilename, goImportPath)
+
+	templateData := TemplateData{
+		PackageName: targetPackageName,
+		Services:    []ServiceData{},
+		HTTPPort:    httpPort,
+		GRPCPort:    grpcPort,
+	}
+
+	serviceNameUniquefier := make(map[string]int)
+
+	for _, file := range plugin.Files {
+		if !file.Generate {
+			continue
+		}
+		for _, service := range file.Services {
+			originalGoName := service.GoName
+			count := serviceNameUniquefier[originalGoName]
+			serviceNameUniquefier[originalGoName] = count + 1
+
+			mockServerStructName := originalGoName + "GrpcmockServer"
+			if count > 0 { // Make struct name unique if service name appears in multiple protos
+				mockServerStructName = fmt.Sprintf("%s%d", mockServerStructName, count)
+			}
+
+			svcData := ServiceData{
+				OriginalGoName:       originalGoName,
+				MockServerStructName: mockServerStructName,
+				QualifiedUnimplementedServerType: g.QualifiedGoIdent(protogen.GoIdent{
+					GoName:       "Unimplemented" + originalGoName + "Server",
+					GoImportPath: file.GoImportPath,
+				}),
+				QualifiedRegisterServerFuncName: g.QualifiedGoIdent(protogen.GoIdent{
+					GoName:       "Register" + originalGoName + "Server",
+					GoImportPath: file.GoImportPath,
+				}),
+			}
+
+			for _, method := range service.Methods {
+				fullMethod := fmt.Sprintf("/%s/%s", service.Desc.FullName(), method.Desc.Name())
+
+				inputStreamServerType := ""
+				if method.Desc.IsStreamingClient() || method.Desc.IsStreamingServer() {
+					// Example: service Greeter, method SayHelloStream => Greeter_SayHelloStreamServer
+					streamIdent := protogen.GoIdent{
+						GoName:       fmt.Sprintf("%s_%sServer", service.GoName, method.GoName),
+						GoImportPath: file.GoImportPath,
+					}
+					inputStreamServerType = g.QualifiedGoIdent(streamIdent)
+				}
+
+				// Input and Output types need to be qualified with their package
+				inputIdent := method.Input.GoIdent
+				outputIdent := method.Output.GoIdent
+
+				// For new(pb.Type), we need the non-pointer, qualified name.
+				// protogen.GoIdent.String() gives "pkg.Type". If it's from the same package as the generated server,
+				// we might not need the qualifier. But it's safer to qualify.
+				// g.QualifiedGoIdent gives "*pkg.Type". We need to strip "*".
+
+				qualifiedInputType := g.QualifiedGoIdent(inputIdent)
+				qualifiedOutputType := g.QualifiedGoIdent(outputIdent)
+
+				inputObjectForNew := strings.TrimPrefix(qualifiedInputType, "*")
+				outputObjectForNew := strings.TrimPrefix(qualifiedOutputType, "*")
+
+				methodData := MethodData{
+					GoName:                    method.GoName,
+					FullMethodName:            fullMethod,
+					InputType:                 qualifiedInputType,
+					OutputType:                qualifiedOutputType,
+					ClientStreaming:           method.Desc.IsStreamingClient(),
+					ServerStreaming:           method.Desc.IsStreamingServer(),
+					QualifiedStreamServerType: inputStreamServerType,
+					InputObjectTypeForNew:     inputObjectForNew,
+					OutputObjectTypeForNew:    outputObjectForNew,
+				}
+				svcData.Methods = append(svcData.Methods, methodData)
+			}
+			templateData.Services = append(templateData.Services, svcData)
+		}
+	}
+	if len(templateData.Services) == 0 {
+		log.Println("grpcmock-generator: No services found to generate mock server.")
+		g.Skip() // Don't generate an empty file
 		return nil
 	}
 
-	// Tracks how many times a base name has been used for MockServerStructName
-	serviceFinalNameTracker := make(map[string]int)
-	allServices := []ServiceData{}
-
-	for _, ps := range pendingServices {
-		file := ps.file
-		service := ps.service
-		originalGoName := service.GoName
-
-		currentCount := serviceFinalNameTracker[originalGoName] + 1
-		serviceFinalNameTracker[originalGoName] = currentCount
-
-		mockServerStructName := originalGoName + "MockServer"
-		if serviceGoNameCounts[originalGoName] > 1 {
-			mockServerStructName = fmt.Sprintf("%s%d", mockServerStructName, currentCount)
-		}
-
-		unimplementedServerTypeIdent := protogen.GoIdent{
-			GoName:       "Unimplemented" + originalGoName + "Server",
-			GoImportPath: file.GoImportPath,
-		}
-		registerServerFuncIdent := protogen.GoIdent{
-			GoName:       "Register" + originalGoName + "Server",
-			GoImportPath: file.GoImportPath,
-		}
-
-		svcData := ServiceData{
-			OriginalGoName:                   originalGoName,
-			MockServerStructName:             mockServerStructName,
-			QualifiedUnimplementedServerType: g.QualifiedGoIdent(unimplementedServerTypeIdent),
-			QualifiedRegisterServerFuncName:  g.QualifiedGoIdent(registerServerFuncIdent),
-		}
-
-		for _, method := range service.Methods {
-			fullMethodName := fmt.Sprintf("/%s.%s/%s", file.Desc.Package(), service.Desc.Name(), method.Desc.Name())
-
-			var qualifiedStreamServerType string
-			if method.Desc.IsStreamingClient() || method.Desc.IsStreamingServer() {
-				streamServerTypeIdent := protogen.GoIdent{
-					GoName:       originalGoName + "_" + method.GoName + "Server",
-					GoImportPath: file.GoImportPath,
-				}
-				qualifiedStreamServerType = g.QualifiedGoIdent(streamServerTypeIdent)
-			}
-
-			inputMsgIdent := method.Input.GoIdent
-			prefixedInputIdent := protogen.GoIdent{
-				GoName:       inputMsgIdent.GoName,
-				GoImportPath: file.GoImportPath,
-			}
-
-			outputMsgIdent := method.Output.GoIdent
-			prefixedOutputIdent := protogen.GoIdent{
-				GoName:       outputMsgIdent.GoName,
-				GoImportPath: file.GoImportPath,
-			}
-
-			svcData.Methods = append(svcData.Methods, MethodData{
-				Name:                      string(method.Desc.Name()),
-				GoName:                    method.GoName,
-				InputType:                 g.QualifiedGoIdent(prefixedInputIdent),
-				OutputType:                g.QualifiedGoIdent(prefixedOutputIdent),
-				ClientStreaming:           method.Desc.IsStreamingClient(),
-				ServerStreaming:           method.Desc.IsStreamingServer(),
-				FullMethodName:            fullMethodName,
-				QualifiedStreamServerType: qualifiedStreamServerType,
-			})
-		}
-		allServices = append(allServices, svcData)
-	}
-
-	templateData := TemplateData{
-		Filename:                  outputFilename,
-		PackageName:               targetPackageName,
-		Services:                  allServices,
-		HTTPPort:                  httpPort,
-		GRPCPort:                  grpcPort,
-		HasClientStreamingMethods: hasClientStreaming(allServices),
-	}
-
-	tmpl, err := template.New("grpcmockServer").Parse(serverTemplateContent)
-	if err != nil {
-		return fmt.Errorf("failed to parse server template: %w", err)
-	}
-
-	var buffer strings.Builder
-	if err := tmpl.Execute(&buffer, templateData); err != nil {
+	tmpl := template.Must(template.New("grpcmockServer").Parse(serverTemplateContent))
+	if err := tmpl.Execute(g, templateData); err != nil {
 		return fmt.Errorf("failed to execute server template: %w", err)
 	}
 
-	g.P(buffer.String())
 	return nil
 }

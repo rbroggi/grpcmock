@@ -10,14 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rbroggi/grpcmock/internal/runtime"
+	"github.com/rbroggi/grpcmock/internal/runtime/api"
 	"github.com/rbroggi/grpcmock/internal/runtime/storage"
 )
 
 // storeInterface defines the methods that a store should implement.
 type storeInterface interface {
-	CreateExpectation(exp runtime.GRPCCallExpectation) (string, error)
-	ListExpectations() []runtime.GRPCCallExpectation
+	CreateExpectation(exp api.GRPCCallExpectation) (string, error)
+	ListExpectations() []api.GRPCCallExpectation
 	GetMatchCountByID(id string) int
 	ClearAll()
 }
@@ -58,7 +58,7 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 	// Add endpoints for match counts and satisfaction verification
 	typedStore, ok := store.(interface {
 		GetMatchCounts() map[string]int
-		ListExpectations() map[string][]runtime.GRPCCallExpectation
+		ListExpectations() map[string][]api.GRPCCallExpectation
 	})
 	if ok {
 		httpMux.HandleFunc("/verifications/counts", func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ func StartHTTPServer(httpPort string, httpMux *http.ServeMux, store storeInterfa
 func handleExpectations(w http.ResponseWriter, r *http.Request, store storeInterface) {
 	switch r.Method {
 	case http.MethodPost:
-		var exp runtime.GRPCCallExpectation
+		var exp api.GRPCCallExpectation
 		if err := json.NewDecoder(r.Body).Decode(&exp); err != nil {
 			writeErrorResponse(w, http.StatusBadRequest, "Failed to decode expectation", err)
 			return
